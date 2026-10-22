@@ -1181,6 +1181,8 @@ class ProxyApp:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="打开主窗口", command=self._tray_restore)
         menu.add_separator()
+        # 退出只 quit 不 destroy：tk_popup 阻塞期间 Tcl 定时器照跑，在菜单循环里
+        # destroy 会踩烂收场；菜单选完自然关闭，mainloop 退出后由 __main__ 收尸
         menu.add_command(label="退出", command=self.quit_app)
         pos = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pos))
@@ -1210,7 +1212,9 @@ class ProxyApp:
                 traceback.print_exc()
 
     def quit_app(self):
-        """真正退出（托盘菜单的“退出”）：停转发、存配置、摘掉托盘图标"""
+        """真正退出（托盘菜单的“退出”）：停转发、存配置、摘掉托盘图标。
+        只 quit 不 destroy——destroy . 销毁窗口但**不会终止 mainloop**，进程会
+        空转残活（实测踩过）；mainloop 由 quit 终止，窗口由 __main__ 统一销毁"""
         if self._relay:
             self._relay.stop()  # 只停转发；共享开关状态保留，下次启动自动恢复
         self.save_preset()
@@ -1219,7 +1223,7 @@ class ProxyApp:
                 self._tray.remove()
             except Exception:
                 traceback.print_exc()
-        self.root.destroy()
+        self.root.quit()
 
 
 if __name__ == "__main__":
@@ -1234,3 +1238,4 @@ if __name__ == "__main__":
     # 主窗口摆到屏幕中央，与弹窗共用同一套“放一次→量差值→修正一步”逻辑
     app._center_in(root, 0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
     root.mainloop()
+    root.destroy()  # quit_app 只 quit 不 destroy，mainloop 退出后在这里统一收尸
