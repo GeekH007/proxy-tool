@@ -170,6 +170,8 @@ NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x1, 0x2, 0x4, 0x10
 WM_TRAY_CALLBACK = 0x8000 + 1  # WM_APP+1：托盘鼠标事件回调消息
 WM_LBUTTONUP, WM_LBUTTONDBLCLK = 0x202, 0x203
 WM_RBUTTONUP, WM_CONTEXTMENU = 0x205, 0x7B
+MF_STRING, MF_SEPARATOR = 0x0, 0x800
+TPM_RIGHTBUTTON, TPM_BOTTOMALIGN, TPM_RETURNCMD = 0x2, 0x20, 0x100
 
 
 class _NOTIFYICONDATAW(ctypes.Structure):
@@ -216,6 +218,12 @@ kernel32.GetModuleHandleW.restype = ctypes.c_void_p
 kernel32.GetModuleHandleW.argtypes = [ctypes.c_void_p]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(_NOTIFYICONDATAW)]
+user32.CreatePopupMenu.restype = wintypes.HMENU
+user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+user32.TrackPopupMenu.restype = wintypes.BOOL  # TPM_RETURNCMD 时返回的是命令 id
+user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                                  wintypes.DWORD, wintypes.HWND, ctypes.c_void_p]
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
 
 
 class TrayIcon:
@@ -307,6 +315,29 @@ class TrayIcon:
         if self._added:
             shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
             self._added = False
+
+    def show_menu(self, entries):
+        """弹原生托盘菜单（TrackPopupMenu，资源管理器同款），阻塞至菜单关闭，
+        返回被点中项的回调（未选中返回 None）。**必须在主线程调用**（内部
+        _ui 入队后到达，调用点即安全点，返回的回调可直接执行）。
+        entries: [(label, callback), ...]，label 为 "-" 画分隔线。
+        不用 Tk 菜单：tk_popup 在托盘场景真实点击不派发选中（实测玄学），
+        原生菜单的派发由 Windows 内部完成，不经过 Tcl。"""
+        hmenu = user32.CreatePopupMenu()
+        for i, (label, _cb) in enumerate(entries):
+            if label == "-":
+                user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
+            else:
+                user32.AppendMenuW(hmenu, MF_STRING, i + 1, label)
+        pos = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pos))
+        # 前台必须给拥有菜单的窗口，事后 WM_NULL 配对收场（经典托盘菜单三件套）
+        user32.SetForegroundWindow(self._hwnd)
+        cmd = user32.TrackPopupMenu(hmenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                                    pos.x, pos.y, 0, self._hwnd, None)
+        user32.PostMessageW(self._hwnd, 0, 0, 0)  # WM_NULL
+        user32.DestroyMenu(hmenu)
+        return entries[cmd - 1][1] if 0 < cmd <= len(entries) else None
 
 
 # ---------- 局域网共享（透明 TCP 转发到上游代理） ----------
@@ -1178,24 +1209,17 @@ class ProxyApp:
         self._ui(self._show_tray_menu)  # 同上：菜单的创建/弹出必须回主循环做
 
     def _show_tray_menu(self):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="打开主窗口", command=self._tray_restore)
-        menu.add_separator()
-        # 退出只 quit 不 destroy：tk_popup 阻塞期间 Tcl 定时器照跑，在菜单循环里
-        # destroy 会踩烂收场；菜单选完自然关闭，mainloop 退出后由 __main__ 收尸
-        menu.add_command(label="退出", command=self.quit_app)
-        pos = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pos))
-        hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-        try:
-            # 前台必须给“拥有菜单”的主窗口；给别的隐藏窗口菜单会一点就消失。
-            # 事后 WM_NULL 配对，菜单才能正常收场
-            user32.SetForegroundWindow(hwnd)
-            menu.tk_popup(pos.x, pos.y)
-        finally:
-            menu.grab_release()
-            menu.destroy()  # 每次右键都新建，用完即毁，别积攒孤儿 Tcl 窗口
-            user32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL
+        # 本方法在主线程安全点执行（_ui 入队到达），原生菜单的选中由 Windows
+        # 派发，点中的回调直接在这里执行即可
+        if self._tray is None:
+            return
+        cb = self._tray.show_menu([
+            ("打开主窗口", self._do_tray_restore),
+            ("-", None),
+            ("退出", self.quit_app),
+        ])
+        if cb:
+            cb()
 
     def on_close(self):
         """点窗口 X：藏到托盘继续跑，代理和共享都不断。
