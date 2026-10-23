@@ -650,6 +650,8 @@ class SocksServer:
         else:
             raise _SocksError(8, "地址类型不支持")
         port = int.from_bytes(self._recv_exact(client, 2), "big")
+        if ":" in host:  # IPv6 字面量进 CONNECT 请求行必须加方括号，否则上游解析不了
+            host = f"[{host}]"
         return f"{host}:{port}"
 
     def _dial_upstream(self, client, target: str):
@@ -1127,6 +1129,7 @@ class ProxyApp:
             c2, d2 = self._socks.snapshot()
             devs = _merge_devs(devs, d2)
             conns += c2
+        devs.sort(key=lambda x: -x[1])
         return conns, devs
 
     def _refresh_share_status(self):
