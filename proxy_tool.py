@@ -695,7 +695,7 @@ class ProxyApp:
         share_frm.grid(row=8, column=1, sticky="w", **pad)
         self.share_btn = tk.Button(share_frm, text="开启共享", width=8, command=self.toggle_share)
         self.share_btn.pack(side="left")
-        tk.Button(share_frm, text="设置…", width=6, command=self.open_settings).pack(side="left", padx=(6, 0))
+        tk.Button(share_frm, text="设置", width=4, command=self.open_settings).pack(side="left", padx=(6, 0))
         tk.Button(share_frm, text="客户端", width=6, command=self.open_clients).pack(side="left", padx=(6, 0))
         self.share_status_var = tk.StringVar()
         self.share_status_label = tk.Label(frm, textvariable=self.share_status_var, fg="#555",
@@ -1149,7 +1149,7 @@ class ProxyApp:
             if picked:
                 path_var.set(os.path.normpath(picked))
 
-        tk.Button(frm, text="浏览…", command=browse).grid(row=1, column=2, padx=(0, 8))
+        tk.Button(frm, text="浏览", command=browse).grid(row=1, column=2, padx=(0, 8))
 
         tk.Label(frm, text="切换路径时会把当前配置复制到新位置；\n改了共享端口后需重新点一次“开启共享”。",
                  fg="#888", justify="left").grid(row=2, column=0, columnspan=3, sticky="w", **pad)

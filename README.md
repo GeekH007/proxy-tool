@@ -44,7 +44,7 @@ pythonw proxy_tool.py
 ## 注意事项
 
 - 首次开启共享会弹 **UAC**（`netsh` 加防火墙规则，仅放行本机所在子网）
-- 配置默认存于 `%APPDATA%\ProxyTool\`（`proxy_config.json` 预设 + `settings.json` 应用设置），位置可在「设置…」中切换，写盘均为原子替换
+- 配置默认存于 `%APPDATA%\ProxyTool\`（`proxy_config.json` 预设 + `settings.json` 应用设置），位置可在「设置」中切换，写盘均为原子替换
 - 程序不产生日志文件，不留临时垃圾
 - 窗口标题（`系统代理工具`）参与单实例定位，请勿修改 `APP_TITLE`
 
