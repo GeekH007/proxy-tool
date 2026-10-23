@@ -642,6 +642,9 @@ class ProxyApp:
                                        values=[p["name"] for p in self.presets])
         self.preset_box.pack(side="left")
         self.preset_box.bind("<<ComboboxSelected>>", self.on_preset_selected)
+        self.save_preset_btn = tk.Button(preset_frm, text="存预设", width=6,
+                                         command=self.save_preset_clicked)
+        self.save_preset_btn.pack(side="left", padx=(4, 0))
         tk.Button(preset_frm, text="删除", width=3, command=self.delete_preset).pack(side="left", padx=(4, 0))
 
         tk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
@@ -736,8 +739,8 @@ class ProxyApp:
         self._sync_relay_upstream()  # 共享运行中也要跟上切换后的地址
         self.save_preset()
 
-    def save_preset(self):
-        """把当前填写的地址端口存进当前名字的预设（名字是新的则新建）"""
+    def save_preset(self) -> bool:
+        """把当前填写的地址端口存进当前名字的预设（名字是新的则新建）。返回是否落盘成功"""
         ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
         name = self.preset_var.get().strip()
         if not name:
@@ -754,6 +757,15 @@ class ProxyApp:
             save_config(name, self.presets, self._share_cfg, self.settings["config_path"])
         except OSError as e:
             messagebox.showerror("错误", f"保存配置失败：\n{e}", parent=self.root)
+            return False
+        return True
+
+    def save_preset_clicked(self):
+        """「存预设」按钮：不等开启代理，立即把当前名字+地址端口落盘（名字新的就新增）"""
+        if self.save_preset():
+            btn = self.save_preset_btn
+            btn.config(text="✓ 已存")
+            self.root.after(1200, lambda: btn.config(text="存预设"))
 
     def _sync_preset_box(self):
         self.preset_box.config(values=[p["name"] for p in self.presets])
