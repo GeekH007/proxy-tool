@@ -1142,8 +1142,9 @@ class ProxyApp:
         up = self._relay.upstream
         tail = f"近10分钟设备 {n_dev} 台，当前连接 {conns} 个" if devs or conns else "暂无设备连接"
         auth = f"账号 {self.settings['socks_user']}" if self.settings["socks_user"] else "无认证"
-        text = (f"✓ 共享中：HTTP 代理填 {self._lan_hint}:{self.share_port}，"
-                f"SOCKS5 填 {self._lan_hint}:{self.socks_port}（{auth}）\n"
+        text = (f"✓ 共享中\n"
+                f"HTTP: {self._lan_hint}:{self.share_port}\n"
+                f"SOCKS5: {self._lan_hint}:{self.socks_port}（{auth}）\n"
                 f"转发到 {up[0]}:{up[1]} ｜ {tail}")
         if self._socks and self._socks.last_error:
             text += f"\n最近 SOCKS 失败：{self._socks.last_error}"
