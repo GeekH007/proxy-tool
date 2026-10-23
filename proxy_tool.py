@@ -587,6 +587,25 @@ def save_config(current: str, presets: list, share: bool = False, custom: str = 
     os.replace(tmp, path)  # 原子替换，写一半断电也不会损坏配置
 
 
+# 连接失败原因的人话映射（errno / Windows socket 错误码）
+_CONN_ERR_HINTS = {
+    10061: "连不上代理（代理没开，或地址/端口不对）",
+    10060: "3 秒无响应（超时）",
+    11001: "代理主机名解析不了（检查地址是否填对）",
+    10054: "连接被重置（端口不对或被拦截）",
+}
+
+
+def _friendly_conn_error(reason) -> str:
+    code = getattr(reason, "errno", None) or getattr(reason, "winerror", None)
+    hint = _CONN_ERR_HINTS.get(code)
+    if hint:
+        return hint
+    if "timed out" in str(reason).lower():  # socket.timeout 可能不带错误码
+        return _CONN_ERR_HINTS[10060]
+    return str(reason)
+
+
 # ---------- 界面 ----------
 
 class ProxyApp:
@@ -595,7 +614,6 @@ class ProxyApp:
         root.title(APP_TITLE)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.bind("<Return>", lambda _e: self.apply(True))  # 回车 = 应用并开启
 
         self.settings = load_settings()
         self.share_port = self.settings["share_port"]
@@ -604,6 +622,7 @@ class ProxyApp:
         self._tray = None          # TrayIcon，创建成功后赋值；失败则无托盘
         self._tray_hinted = False  # "已藏到托盘"的气泡每次运行只提示一次
         self._fw_pending = False  # 正在等 UAC/防火墙规则写入，期间忽略重复点击
+        self._test_gen = 0        # 测试轮次：地址变更后旧结果（含在途）作废
         self._ui_queue = queue.Queue()  # 工作线程→主线程的 UI 任务队列
         self._pump_ui_queue()
         cfg = load_config(self.settings["config_path"])
@@ -627,14 +646,18 @@ class ProxyApp:
 
         tk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
         self.ip_var = tk.StringVar(value=self._current_preset()["ip"])
-        tk.Entry(frm, textvariable=self.ip_var, width=22).grid(row=1, column=1, sticky="w", **pad)
+        self.ip_entry = tk.Entry(frm, textvariable=self.ip_var, width=22)
+        self.ip_entry.grid(row=1, column=1, sticky="w", **pad)
 
         tk.Label(frm, text="代理端口").grid(row=2, column=0, sticky="e", **pad)
         self.port_var = tk.StringVar(value=self._current_preset()["port"])
         self.port_entry = tk.Entry(frm, textvariable=self.port_var, width=22)
         self.port_entry.grid(row=2, column=1, sticky="w", **pad)
-        self.port_var.trace_add("write", lambda *_: self._validate_port())  # 即时校验
-        self._validate_port()
+        # 回车=应用并开启，只绑输入框：绑 root 会把删除按钮/下拉框上的回车也误触成开代理
+        for ent in (self.ip_entry, self.port_entry):
+            ent.bind("<Return>", lambda _e: self.apply(True))
+        self.ip_var.trace_add("write", self._on_addr_changed)    # 编辑即校验+作废旧测试结果
+        self.port_var.trace_add("write", self._on_addr_changed)
 
         self.status_var = tk.StringVar()
         tk.Label(frm, textvariable=self.status_var, fg="#555").grid(
@@ -646,8 +669,10 @@ class ProxyApp:
         self.test_btn = tk.Button(frm, text="测试连通", width=8, command=self.test_connectivity)
         self.test_btn.grid(row=5, column=0, sticky="w", padx=(12, 4), pady=(0, 6))
         self.test_result_var = tk.StringVar()
-        self.test_result_label = tk.Label(frm, textvariable=self.test_result_var, fg="#555")
+        self.test_result_label = tk.Label(frm, textvariable=self.test_result_var, fg="#555",
+                                          wraplength=300)  # 长错误文本折行，别撑宽定宽窗口
         self.test_result_label.grid(row=5, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
+        self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
 
         self.autostart_var = tk.BooleanVar(value=get_autostart())
         tk.Checkbutton(frm, text="开机自动启动", variable=self.autostart_var,
@@ -790,10 +815,15 @@ class ProxyApp:
                 return port
         return None
 
-    def _validate_port(self):
-        port = self.port_var.get().strip()
-        ok = not port or self._parse_port(port) is not None  # 空=还没填，不算错
-        self.port_entry.config(bg="#ffffff" if ok else "#ffdcdc")
+    def _on_addr_changed(self, *_):
+        """地址/端口被编辑（含切预设的联动写入）：即时红框校验 + 旧测试结果作废"""
+        ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
+        ip_ok = not ip or self._valid_host(ip)  # 空=还没填，不算错
+        port_ok = not port or self._parse_port(port) is not None
+        self.ip_entry.config(bg="#ffffff" if ip_ok else "#ffdcdc")
+        self.port_entry.config(bg="#ffffff" if port_ok else "#ffdcdc")
+        self._test_gen += 1
+        self.test_result_var.set("")
 
     @staticmethod
     def _valid_host(host: str) -> bool:
@@ -867,9 +897,10 @@ class ProxyApp:
         self.test_btn.config(state="disabled", text="测试中…")
         self.test_result_var.set("正在测试…")
         self.test_result_label.config(fg="#555")
-        threading.Thread(target=self._test_worker, args=(ip, port), daemon=True).start()
+        gen = self._test_gen
+        threading.Thread(target=self._test_worker, args=(ip, port, gen), daemon=True).start()
 
-    def _test_worker(self, ip: str, port: int):
+    def _test_worker(self, ip: str, port: int, gen: int):
         proxies = {"http": f"http://{ip}:{port}", "https": f"http://{ip}:{port}"}
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
         start = time.perf_counter()
@@ -877,16 +908,15 @@ class ProxyApp:
             opener.open(TEST_URL, timeout=3)
         except Exception as e:  # 超时、拒绝连接等统一按失败展示
             reason = getattr(e, "reason", None) or e
-            text = str(reason)
-            if "timed out" in text.lower():
-                text = "3 秒无响应（超时）"
-            self._ui(lambda: self._show_test_result(False, text))
+            self._ui(lambda: self._show_test_result(gen, False, _friendly_conn_error(reason)))
         else:
             ms = round((time.perf_counter() - start) * 1000)
-            self._ui(lambda: self._show_test_result(True, f"{ms} ms"))
+            self._ui(lambda: self._show_test_result(gen, True, f"{ms} ms"))
 
-    def _show_test_result(self, ok: bool, info: str):
+    def _show_test_result(self, gen: int, ok: bool, info: str):
         self.test_btn.config(state="normal", text="测试连通")
+        if gen != self._test_gen:  # 结果到达前地址已被改动：只恢复按钮，结果丢弃
+            return
         if ok:
             self.test_result_var.set(f"✓ 连通（{info}）")
             self.test_result_label.config(fg="#1a7f37")
