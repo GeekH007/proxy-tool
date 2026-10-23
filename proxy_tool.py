@@ -611,6 +611,19 @@ def _friendly_conn_error(reason) -> str:
 class ProxyApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+        # 试验：全 ttk + clam 主题——Tk 内置主题里唯一尊重底色上标的（vista 忽略按钮
+        # background），统一控件风格；代价是整体观感非 Windows 原生
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        self._bg = style.lookup("TFrame", "background")
+        root.configure(background=self._bg)
+        # 大按钮状态底色 + 悬停/按下微调（开关代理）
+        style.configure("On.TButton", background="#ffd7d7")
+        style.map("On.TButton", background=[("active", "#ffd0d0"), ("pressed", "#ffc4c4")])
+        style.configure("Off.TButton", background="#d7f0d7")
+        style.map("Off.TButton", background=[("active", "#cdeacd"), ("pressed", "#c0e3c0")])
+        # 输入框校验红框
+        style.configure("Invalid.TEntry", fieldbackground="#ffdcdc")
         root.title(APP_TITLE)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -634,31 +647,31 @@ class ProxyApp:
         self._share_cfg = cfg["share"]  # 共享开关的持久状态（跨启动恢复用）
         self._lan_hint = _primary_lan_ip() or "本机IP"
         pad = {"padx": 12, "pady": 6}
-        frm = tk.Frame(root)
+        frm = ttk.Frame(root)
         frm.pack(padx=4, pady=4)
 
-        tk.Label(frm, text="预设").grid(row=0, column=0, sticky="e", **pad)
-        preset_frm = tk.Frame(frm)
+        ttk.Label(frm, text="预设").grid(row=0, column=0, sticky="e", **pad)
+        preset_frm = ttk.Frame(frm)
         preset_frm.grid(row=0, column=1, sticky="w", **pad)
         self.preset_box = ttk.Combobox(preset_frm, textvariable=self.preset_var, width=16,
                                        values=[p["name"] for p in self.presets])
         self.preset_box.pack(side="left")
         self.preset_box.bind("<<ComboboxSelected>>", self.on_preset_selected)
-        self.save_preset_btn = tk.Button(preset_frm, text="新增", width=6,
+        self.save_preset_btn = ttk.Button(preset_frm, text="新增", width=6,
                                          command=self.on_add_or_save)
         self.save_preset_btn.pack(side="left", padx=(4, 0))
-        self.delete_preset_btn = tk.Button(preset_frm, text="删除", width=3,
+        self.delete_preset_btn = ttk.Button(preset_frm, text="删除", width=3,
                                            command=self.delete_preset)
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
-        tk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
         self.ip_var = tk.StringVar(value=self._current_preset()["ip"])
-        self.ip_entry = tk.Entry(frm, textvariable=self.ip_var, width=22)
+        self.ip_entry = ttk.Entry(frm, textvariable=self.ip_var, width=22)
         self.ip_entry.grid(row=1, column=1, sticky="w", **pad)
 
-        tk.Label(frm, text="代理端口").grid(row=2, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="代理端口").grid(row=2, column=0, sticky="e", **pad)
         self.port_var = tk.StringVar(value=self._current_preset()["port"])
-        self.port_entry = tk.Entry(frm, textvariable=self.port_var, width=22)
+        self.port_entry = ttk.Entry(frm, textvariable=self.port_var, width=22)
         self.port_entry.grid(row=2, column=1, sticky="w", **pad)
         # 回车=应用并开启，只绑输入框：绑 root 会把删除按钮/下拉框上的回车也误触成开代理
         for ent in (self.ip_entry, self.port_entry):
@@ -668,16 +681,16 @@ class ProxyApp:
         self.port_var.trace_add("write", self._on_addr_changed)
 
         self.status_var = tk.StringVar()
-        self.status_label = tk.Label(frm, textvariable=self.status_var, fg="#555")
+        self.status_label = ttk.Label(frm, textvariable=self.status_var, foreground="#555")
         self.status_label.grid(row=3, column=0, columnspan=2, **pad)
 
-        self.btn = tk.Button(frm, width=18, command=self.toggle)
+        self.btn = ttk.Button(frm, width=18, command=self.toggle)
         self.btn.grid(row=4, column=0, columnspan=2, ipady=4, padx=12, pady=(2, 4))
 
-        self.test_btn = tk.Button(frm, text="测试连通", width=8, command=self.test_connectivity)
+        self.test_btn = ttk.Button(frm, text="测试连通", width=8, command=self.test_connectivity)
         self.test_btn.grid(row=5, column=0, sticky="w", padx=(12, 4), pady=(0, 6))
         self.test_result_var = tk.StringVar()
-        self.test_result_label = tk.Label(frm, textvariable=self.test_result_var, fg="#555",
+        self.test_result_label = ttk.Label(frm, textvariable=self.test_result_var, foreground="#555",
                                           wraplength=300)  # 长错误文本折行，别撑宽定宽窗口
         self.test_result_label.grid(row=5, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
         self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
@@ -686,19 +699,19 @@ class ProxyApp:
                                 sticky="ew", padx=12, pady=(2, 2))  # 主功能/辅助设置分区
 
         self.autostart_var = tk.BooleanVar(value=get_autostart())
-        tk.Checkbutton(frm, text="开机自动启动", variable=self.autostart_var,
+        ttk.Checkbutton(frm, text="开机自动启动", variable=self.autostart_var,
                        command=self.toggle_autostart).grid(
             row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
 
-        tk.Label(frm, text="局域网共享").grid(row=8, column=0, sticky="e", **pad)
-        share_frm = tk.Frame(frm)
+        ttk.Label(frm, text="局域网共享").grid(row=8, column=0, sticky="e", **pad)
+        share_frm = ttk.Frame(frm)
         share_frm.grid(row=8, column=1, sticky="w", **pad)
-        self.share_btn = tk.Button(share_frm, text="开启共享", width=8, command=self.toggle_share)
+        self.share_btn = ttk.Button(share_frm, text="开启共享", width=8, command=self.toggle_share)
         self.share_btn.pack(side="left")
-        tk.Button(share_frm, text="设置", width=4, command=self.open_settings).pack(side="left", padx=(6, 0))
-        tk.Button(share_frm, text="客户端", width=6, command=self.open_clients).pack(side="left", padx=(6, 0))
+        ttk.Button(share_frm, text="设置", width=4, command=self.open_settings).pack(side="left", padx=(6, 0))
+        ttk.Button(share_frm, text="客户端", width=6, command=self.open_clients).pack(side="left", padx=(6, 0))
         self.share_status_var = tk.StringVar()
-        self.share_status_label = tk.Label(frm, textvariable=self.share_status_var, fg="#555",
+        self.share_status_label = ttk.Label(frm, textvariable=self.share_status_var, foreground="#555",
                                            justify="left", anchor="w")
         self.share_status_label.grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
         self._set_share_status(self._share_off_text())
@@ -852,12 +865,12 @@ class ProxyApp:
         self.enabled, server = get_system_proxy()
         if self.enabled:
             self.status_var.set(f"● 已开启  {server}")
-            self.status_label.config(fg="#1a7f37")
-            self.btn.config(text="关闭代理", bg="#ffd7d7")
+            self.status_label.config(foreground="#1a7f37")
+            self.btn.config(text="关闭代理", style="On.TButton")
         else:
             self.status_var.set("● 已关闭")
-            self.status_label.config(fg="#555")
-            self.btn.config(text="开启代理", bg="#d7f0d7")
+            self.status_label.config(foreground="#555")
+            self.btn.config(text="开启代理", style="Off.TButton")
 
     @staticmethod
     def _parse_port(text: str):
@@ -874,8 +887,8 @@ class ProxyApp:
         ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
         ip_ok = not ip or self._valid_host(ip)  # 空=还没填，不算错
         port_ok = not port or self._parse_port(port) is not None
-        self.ip_entry.config(bg="#ffffff" if ip_ok else "#ffdcdc")
-        self.port_entry.config(bg="#ffffff" if port_ok else "#ffdcdc")
+        self.ip_entry.config(style="TEntry" if ip_ok else "Invalid.TEntry")
+        self.port_entry.config(style="TEntry" if port_ok else "Invalid.TEntry")
         self._test_gen += 1
         self.test_result_var.set("")
 
@@ -950,7 +963,7 @@ class ProxyApp:
         ip, port = self.ip_var.get().strip(), int(self.port_var.get().strip())
         self.test_btn.config(state="disabled", text="测试中…")
         self.test_result_var.set("正在测试…")
-        self.test_result_label.config(fg="#555")
+        self.test_result_label.config(foreground="#555")
         gen = self._test_gen
         threading.Thread(target=self._test_worker, args=(ip, port, gen), daemon=True).start()
 
@@ -973,10 +986,10 @@ class ProxyApp:
             return
         if ok:
             self.test_result_var.set(f"✓ 连通（{info}）")
-            self.test_result_label.config(fg="#1a7f37")
+            self.test_result_label.config(foreground="#1a7f37")
         else:
             self.test_result_var.set(f"✗ 失败：{info}")
-            self.test_result_label.config(fg="#c62828")
+            self.test_result_label.config(foreground="#c62828")
 
     # ---- 局域网共享 ----
 
@@ -985,7 +998,7 @@ class ProxyApp:
 
     def _set_share_status(self, text: str, color: str = "#555"):
         self.share_status_var.set(text)
-        self.share_status_label.config(fg=color)
+        self.share_status_label.config(foreground=color)
 
     def toggle_share(self):
         if self._relay:
@@ -1127,20 +1140,21 @@ class ProxyApp:
             return
         win = tk.Toplevel(self.root)
         self._settings_win = win
+        win.configure(background=self._bg)  # clam 底色，别让窗口边露白
         win.title("设置")
         win.resizable(False, False)
         win.transient(self.root)
-        frm = tk.Frame(win)
+        frm = ttk.Frame(win)
         frm.pack(padx=14, pady=10)
         pad = {"padx": 8, "pady": 5}
 
-        tk.Label(frm, text="共享监听端口").grid(row=0, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="共享监听端口").grid(row=0, column=0, sticky="e", **pad)
         port_var = tk.StringVar(value=str(self.share_port))
-        tk.Entry(frm, textvariable=port_var, width=12).grid(row=0, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=port_var, width=12).grid(row=0, column=1, sticky="w", **pad)
 
-        tk.Label(frm, text="配置文件路径").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="配置文件路径").grid(row=1, column=0, sticky="e", **pad)
         path_var = tk.StringVar(value=self.settings["config_path"] or CONFIG_FILE)
-        tk.Entry(frm, textvariable=path_var, width=36).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=path_var, width=36).grid(row=1, column=1, sticky="w", **pad)
 
         def browse():
             picked = filedialog.asksaveasfilename(
@@ -1149,12 +1163,12 @@ class ProxyApp:
             if picked:
                 path_var.set(os.path.normpath(picked))
 
-        tk.Button(frm, text="浏览", command=browse).grid(row=1, column=2, padx=(0, 8))
+        ttk.Button(frm, text="浏览", command=browse).grid(row=1, column=2, padx=(0, 8))
 
-        tk.Label(frm, text="切换路径时会把当前配置复制到新位置；\n改了共享端口后需重新点一次“开启共享”。",
-                 fg="#888", justify="left").grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(frm, text="切换路径时会把当前配置复制到新位置；\n改了共享端口后需重新点一次“开启共享”。",
+                 foreground="#888", justify="left").grid(row=2, column=0, columnspan=3, sticky="w", **pad)
 
-        btns = tk.Frame(frm)
+        btns = ttk.Frame(frm)
         btns.grid(row=3, column=0, columnspan=3, pady=(2, 8))
 
         def on_save():
@@ -1193,8 +1207,8 @@ class ProxyApp:
                     self._set_share_status(self._share_off_text())
             win.destroy()
 
-        tk.Button(btns, text="保存", width=8, command=on_save).pack(side="left", padx=6)
-        tk.Button(btns, text="取消", width=8, command=win.destroy).pack(side="left")
+        ttk.Button(btns, text="保存", width=8, command=on_save).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", width=8, command=win.destroy).pack(side="left")
         win.bind("<Return>", lambda _e: on_save())  # 回车=保存，Esc=取消
         win.bind("<Escape>", lambda _e: win.destroy())
         self._center_over(win)  # 摆到主窗口中央再锁模态
@@ -1233,6 +1247,7 @@ class ProxyApp:
             return
         win = tk.Toplevel(self.root)
         self._clients_win = win
+        win.configure(background=self._bg)  # clam 底色，别让窗口边露白
         win.title("共享客户端")
         win.resizable(False, False)
         win.transient(self.root)
@@ -1242,7 +1257,7 @@ class ProxyApp:
             tv.heading(col, text=text)
             tv.column(col, width=width, anchor="w" if col == "ip" else "center")
         tv.pack(padx=10, pady=(10, 4))
-        summary = tk.Label(win, text="", fg="#555")
+        summary = ttk.Label(win, text="", foreground="#555")
         summary.pack(padx=10, pady=(0, 10))
 
         def refresh():
