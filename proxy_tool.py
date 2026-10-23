@@ -29,6 +29,7 @@ LEGACY_CONFIG_FILE = os.path.join(_BASE_DIR, "proxy_config.json")  # 旧版配�
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = "7890"
 DEFAULT_SHARE_PORT = 7891
+DEFAULT_SOCKS_PORT = 7892  # SOCKS5 通道端口（局域网共享的第二条通道）
 APP_TITLE = "系统代理工具"
 MUTEX_NAME = "MyXm_ProxyTool_SingleInstance"
 TEST_URL = "http://www.gstatic.com/generate_204"
@@ -354,27 +355,30 @@ def _primary_lan_ip():
         s.close()
 
 
-def _rule_name(port: int) -> str:
-    return f"ProxyTool LAN Share {port}"
+def _rule_name(port: int, socks: bool = False) -> str:
+    return f"ProxyTool LAN {'SOCKS' if socks else 'Share'} {port}"
 
 
-def firewall_rule_exists(port: int) -> bool:
+def firewall_rule_exists(port: int, socks: bool = False) -> bool:
     try:
         # timeout：防火墙服务坏了会让 netsh 卡死，不设上限会把共享流程永久卡住；
         # CREATE_NO_WINDOW：pythonw 没控制台，不加这个 netsh 会自己弹黑框闪一下
         out = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule",
-                              f"name={_rule_name(port)}"], capture_output=True,
+                              f"name={_rule_name(port, socks)}"], capture_output=True,
                              creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
     except subprocess.TimeoutExpired:
         return False  # 卡死按“没规则”处理：让用户重开一次，也别锁死 _fw_pending
     return out.returncode == 0
 
 
-def add_firewall_rule_elevated(port: int) -> bool:
-    """弹 UAC 提权加放行规则，只对本机所在子网开放"""
-    params = (f'advfirewall firewall add rule name="{_rule_name(port)}" '
-              f"dir=in action=allow protocol=TCP localport={port} remoteip=localsubnet")
-    return ctypes.windll.shell32.ShellExecuteW(None, "runas", "netsh", params, None, 0) > 32
+def add_firewall_rule_elevated(rules) -> bool:
+    """弹 UAC 提权加放行规则（只对本机所在子网开放）。
+    rules: [(port, socks)，...] 多条规则在同一个提权进程里 & 串联——UAC 只弹一次"""
+    cmds = (f'netsh advfirewall firewall add rule name="{_rule_name(p, s)}" '
+            f"dir=in action=allow protocol=TCP localport={p} remoteip=localsubnet"
+            for p, s in rules)
+    return ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", "cmd.exe", "/c " + " & ".join(cmds), None, 0) > 32
 
 
 class RelayServer:
@@ -502,7 +506,264 @@ class RelayServer:
                 pass
 
 
-# ---------- 应用设置（共享端口、配置文件路径） ----------
+# ---------- SOCKS5 网关（桥接到 HTTP 上游代理） ----------
+
+class _SocksError(Exception):
+    """SOCKS5 会话失败：rep=回给客户端的错误码，消息给人看（状态行）。
+    rep=None 表示握手阶段已回过应答（如 0xFF），_pump 里别再补发"""
+
+    def __init__(self, rep, msg: str):
+        super().__init__(msg)
+        self.rep = rep
+
+
+class SocksServer:
+    """0.0.0.0:listen_port 收 SOCKS5（仅 CONNECT），桥接到 HTTP 上游代理。
+    上游只认 HTTP 代理时的协议转换网关：对上游发 CONNECT，200 后双向搬字节。
+    启停/记账/管道结构与 RelayServer 同款。"""
+
+    HANDSHAKE_TIMEOUT = 5  # 握手+拨上游限时；隧道接通后两边都清掉
+
+    def __init__(self, listen_port: int, upstream: tuple, user: str = "", password: str = ""):
+        self.listen_port = listen_port
+        self.upstream = upstream  # (ip, port)，可随时替换，对新连接生效
+        self.user = user.strip()
+        self.password = password
+        self.last_error = ""  # 最近一次 SOCKS 会话失败原因（带时刻，状态行显示）
+        self._srv = None
+        self._on = False
+        self._lock = threading.Lock()
+        self.active_conns = 0
+        self.devices = {}
+        self._live = set()
+
+    def start(self):
+        srv = socket.socket()
+        try:
+            srv.bind(("0.0.0.0", self.listen_port))
+            srv.listen(16)
+        except OSError:
+            srv.close()
+            raise
+        self._srv, self._on = srv, True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def stop(self):
+        self._on = False
+        if self._srv:
+            self._srv.close()
+            self._srv = None
+        # 同 RelayServer：已建立的/握手中的连接都掐断，keep-alive 别想赖着
+        with self._lock:
+            pairs = list(self._live)
+        for pair in pairs:
+            for s in pair:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    def _accept_loop(self):
+        srv = self._srv  # 局部快照：stop() 会把 _srv 置 None
+        while self._on and srv is not None:
+            try:
+                client, _ = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._pump, args=(client,), daemon=True).start()
+
+    def snapshot(self):
+        now = time.monotonic()
+        with self._lock:
+            if self.devices:
+                self.devices = {ip: d for ip, d in self.devices.items()
+                                if d["conns"] > 0 or now - d["last"] < DEVICE_TTL_SEC}
+            devs = sorted(((ip, d["conns"], int(now - d["last"]))
+                           for ip, d in self.devices.items()),
+                          key=lambda x: -x[1])
+            return self.active_conns, devs
+
+    def _note_error(self, e: _SocksError):
+        self.last_error = f"{time.strftime('%H:%M')} {e}"
+
+    @staticmethod
+    def _recv_exact(sock, n: int) -> bytes:
+        """SOCKS 握手按字段长度读全——TCP 分包下一次 recv 可能只到半截"""
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("客户端提前断开")
+            buf += chunk
+        return bytes(buf)
+
+    @staticmethod
+    def _reply(client, rep: int):
+        """VER=5 REP RSV ATYP=IPv4 BND=0.0.0.0:0"""
+        try:
+            client.sendall(bytes((5, rep, 0, 1)) + b"\x00" * 6)
+        except OSError:
+            pass
+
+    def _handshake(self, client) -> str:
+        """认证 + 读 CONNECT 请求，返回 "host:port"。失败抛 _SocksError"""
+        ver, nmethods = self._recv_exact(client, 2)
+        if ver != 5:
+            raise _SocksError(1, "不是 SOCKS5 握手")
+        methods = self._recv_exact(client, nmethods)
+        if self.user:  # RFC 1929 用户名密码认证（设置里留空 = 无认证）
+            if 2 not in methods:
+                self._reply(client, 0xFF)
+                raise _SocksError(None, "客户端不支持用户名密码认证")
+            client.sendall(b"\x05\x02")
+            if self._recv_exact(client, 1)[0] != 1:
+                raise _SocksError(1, "认证子协商版本错误")
+            ulen = self._recv_exact(client, 1)[0]
+            uname = self._recv_exact(client, ulen).decode("utf-8", "replace")
+            plen = self._recv_exact(client, 1)[0]
+            passwd = self._recv_exact(client, plen).decode("utf-8", "replace")
+            ok = uname == self.user and passwd == self.password
+            client.sendall(b"\x01" + (b"\x00" if ok else b"\x01"))
+            if not ok:
+                raise _SocksError(1, "用户名或密码错误")
+        else:
+            if 0 not in methods:
+                self._reply(client, 0xFF)
+                raise _SocksError(None, "客户端不支持无认证方式")
+            client.sendall(b"\x05\x00")
+        ver, cmd, _rsv, atyp = self._recv_exact(client, 4)
+        if ver != 5:
+            raise _SocksError(1, "请求版本错误")
+        if cmd != 1:
+            raise _SocksError(7, "仅支持 CONNECT（不支持 BIND/UDP 转发）")
+        if atyp == 1:
+            host = socket.inet_ntoa(self._recv_exact(client, 4))
+        elif atyp == 3:  # 域名不在本地解析，原样交给上游（顺带规避本地 DNS 污染）
+            n = self._recv_exact(client, 1)[0]
+            host = self._recv_exact(client, n).decode("ascii", "replace")
+        elif atyp == 4:
+            host = socket.inet_ntop(socket.AF_INET6, self._recv_exact(client, 16))
+        else:
+            raise _SocksError(8, "地址类型不支持")
+        port = int.from_bytes(self._recv_exact(client, 2), "big")
+        return f"{host}:{port}"
+
+    def _dial_upstream(self, client, target: str):
+        """对 HTTP 上游发 CONNECT，200 后回 SOCKS 成功，返回已接通的上游 socket"""
+        up = socket.create_connection(self.upstream, timeout=self.HANDSHAKE_TIMEOUT)
+        try:
+            up.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii"))
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                if len(resp) > 8192:
+                    raise _SocksError(1, "上游响应头异常")
+                chunk = up.recv(4096)
+                if not chunk:
+                    raise _SocksError(1, "上游提前断开")
+                resp += chunk
+            status = resp.split(b"\r\n", 1)[0]
+            if b" 200" not in status:
+                raise _SocksError(5, f"上游拒绝 CONNECT：{status.decode('latin-1', 'replace')}")
+        except Exception:
+            up.close()
+            raise
+        leftover = resp.split(b"\r\n\r\n", 1)[1]
+        self._reply(client, 0)  # 隧道通了才告诉客户端成功
+        if leftover:  # 少见：上游把隧道首包捎在响应里，补交给客户端
+            client.sendall(leftover)
+        return up
+
+    def _pump(self, client):
+        try:
+            ip = client.getpeername()[0]
+        except OSError:
+            ip = "未知"
+        with self._lock:
+            dev = self.devices.setdefault(ip, {"conns": 0, "last": time.monotonic()})
+            dev["conns"] += 1
+            self.active_conns += 1
+        up = None
+        try:
+            t_pending = (client,)
+            with self._lock:
+                self._live.add(t_pending)  # 握手期间就登记，stop() 才掐得到
+            try:
+                try:
+                    client.settimeout(self.HANDSHAKE_TIMEOUT)  # 握手限时，防半开连接挂死线程
+                    target = self._handshake(client)
+                    up = self._dial_upstream(client, target)
+                except _SocksError as e:
+                    self._note_error(e)
+                    if e.rep is not None:
+                        self._reply(client, e.rep)
+                    return
+                except (OSError, ConnectionError) as e:
+                    self._note_error(_SocksError(1, str(e) or "连接中断"))
+                    self._reply(client, 1)
+                    return
+                up.settimeout(None)      # 同 RelayServer：超时不得残留到长连接
+                client.settimeout(None)
+                pair = (client, up)
+                with self._lock:
+                    self._live.add(pair)
+                    stopped = not self._on
+                if stopped:
+                    return
+                t1 = threading.Thread(target=self._pipe, args=(client, up), daemon=True)
+                t2 = threading.Thread(target=self._pipe, args=(up, client), daemon=True)
+                t1.start(); t2.start()
+                t1.join(); t2.join()
+                with self._lock:
+                    self._live.discard(pair)
+            finally:
+                with self._lock:
+                    self._live.discard(t_pending)
+        finally:
+            for s in (client, up):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            with self._lock:
+                dev["conns"] -= 1
+                dev["last"] = time.monotonic()
+                self.active_conns -= 1
+
+    @staticmethod
+    def _pipe(src, dst):  # 同 RelayServer._pipe
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def _merge_devs(a, b):
+    """两路共享的设备表合并：连接数相加，活跃时间取更近的"""
+    m = {ip: [c, sec] for ip, c, sec in a}
+    for ip, c, sec in b:
+        if ip in m:
+            m[ip][0] += c
+            m[ip][1] = min(m[ip][1], sec)
+        else:
+            m[ip] = [c, sec]
+    return [(ip, c, s) for ip, (c, s) in m.items()]
+
+
+# ---------- 应用设置（共享端口、SOCKS5、配置文件路径） ----------
 
 def load_settings() -> dict:
     try:
@@ -513,9 +774,17 @@ def load_settings() -> dict:
     port = data.get("share_port")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         port = DEFAULT_SHARE_PORT
+    socks_port = data.get("socks_port")
+    if not isinstance(socks_port, int) or not 1 <= socks_port <= 65535:
+        socks_port = DEFAULT_SOCKS_PORT
+    user = data.get("socks_user")
+    user = user.strip() if isinstance(user, str) else ""
+    password = data.get("socks_pass")
+    password = password if isinstance(password, str) else ""
     path = data.get("config_path")
     path = str(path).strip() if isinstance(path, str) else ""
-    return {"share_port": port, "config_path": path}
+    return {"share_port": port, "socks_port": socks_port, "socks_user": user,
+            "socks_pass": password, "config_path": path}
 
 
 def save_settings(settings: dict):
@@ -631,6 +900,7 @@ class ProxyApp:
 
         self.settings = load_settings()
         self.share_port = self.settings["share_port"]
+        self.socks_port = self.settings["socks_port"]
         self._settings_win = None
         self._clients_win = None
         self._tray = None          # TrayIcon，创建成功后赋值；失败则无托盘
@@ -643,7 +913,8 @@ class ProxyApp:
         cfg = load_config(self.settings["config_path"])
         self.presets = cfg["presets"]
         self.preset_var = tk.StringVar(value=cfg["current"])
-        self._relay = None          # 运行中的 RelayServer
+        self._relay = None          # 运行中的 RelayServer（HTTP 透明转发）
+        self._socks = None          # 运行中的 SocksServer（SOCKS5→HTTP 网关）
         self._share_cfg = cfg["share"]  # 共享开关的持久状态（跨启动恢复用）
         self._lan_hint = _primary_lan_ip() or "本机IP"
         pad = {"padx": 12, "pady": 6}
@@ -849,17 +1120,30 @@ class ProxyApp:
                 traceback.print_exc()  # 单个任务出错别拖垮轮询；行为等同 Tk 默认
         self.root.after(50, self._pump_ui_queue)
 
+    def _share_snapshot(self):
+        """HTTP 转发 + SOCKS5 两路合并的 (连接总数, [(ip, 连接数, 距最后活跃秒)])"""
+        conns, devs = self._relay.snapshot() if self._relay else (0, [])
+        if self._socks:
+            c2, d2 = self._socks.snapshot()
+            devs = _merge_devs(devs, d2)
+            conns += c2
+        return conns, devs
+
     def _refresh_share_status(self):
-        """共享运行中：状态行显示设备/连接计数（设备按来源 IP 去重，近10分钟活跃）"""
+        """共享运行中：状态行显示双通道地址 + 设备/连接计数 + 最近 SOCKS 失败"""
         if not self._relay:
             return
-        conns, devs = self._relay.snapshot()
+        conns, devs = self._share_snapshot()
         n_dev = sum(1 for _, _, sec in devs if sec <= ACTIVE_WINDOW_SEC)
         up = self._relay.upstream
         tail = f"近10分钟设备 {n_dev} 台，当前连接 {conns} 个" if devs or conns else "暂无设备连接"
-        self._set_share_status(
-            f"✓ 共享中：其他设备把代理填成 {self._lan_hint}:{self.share_port}\n"
-            f"转发到 {up[0]}:{up[1]} ｜ {tail}", color="#1a7f37")
+        auth = f"账号 {self.settings['socks_user']}" if self.settings["socks_user"] else "无认证"
+        text = (f"✓ 共享中：HTTP 代理填 {self._lan_hint}:{self.share_port}，"
+                f"SOCKS5 填 {self._lan_hint}:{self.socks_port}（{auth}）\n"
+                f"转发到 {up[0]}:{up[1]} ｜ {tail}")
+        if self._socks and self._socks.last_error:
+            text += f"\n最近 SOCKS 失败：{self._socks.last_error}"
+        self._set_share_status(text, color="#1a7f37")
 
     def refresh_status(self):
         self.enabled, server = get_system_proxy()
@@ -928,6 +1212,8 @@ class ProxyApp:
         up = self._read_upstream()
         if up and self._relay:
             self._relay.upstream = up
+        if up and self._socks:
+            self._socks.upstream = up
 
     def toggle(self):
         self.apply(not self.enabled)
@@ -994,16 +1280,21 @@ class ProxyApp:
     # ---- 局域网共享 ----
 
     def _share_off_text(self, port=None) -> str:
-        return f"未开启：开启后其他设备把代理填成 {self._lan_hint}:{port or self.share_port}"
+        return (f"未开启：开启后其他设备把 HTTP 代理填成 {self._lan_hint}:{port or self.share_port}"
+                f"，SOCKS5 填 {self._lan_hint}:{self.socks_port}")
 
     def _set_share_status(self, text: str, color: str = "#555"):
         self.share_status_var.set(text)
         self.share_status_label.config(foreground=color)
 
     def toggle_share(self):
-        if self._relay:
-            self._relay.stop()
-            self._relay = None
+        if self._relay or self._socks:
+            if self._relay:
+                self._relay.stop()
+                self._relay = None
+            if self._socks:
+                self._socks.stop()
+                self._socks = None
             self.share_btn.config(text="开启共享")
             self._share_cfg = False
             self.save_preset()
@@ -1035,11 +1326,12 @@ class ProxyApp:
 
     def _check_fw_then_start(self, up, lan):
         """后台查防火墙规则（netsh 会卡主线程），查完回主线程决定弹 UAC 还是直接开"""
-        port = self.share_port
-        has_rule = firewall_rule_exists(port)
+        port, socks_port = self.share_port, self.socks_port
+        has_rule = (firewall_rule_exists(port)
+                    and firewall_rule_exists(socks_port, socks=True))
 
         def proceed():
-            if port != self.share_port:  # 检查期间用户在设置里改了端口：旧结果作废
+            if (port, socks_port) != (self.share_port, self.socks_port):  # 检查期间端口被改：作废重来
                 self._restart_fw_check(lan)
                 return
             if has_rule:
@@ -1048,30 +1340,35 @@ class ProxyApp:
                 return
             if not messagebox.askyesno(
                     "局域网共享",
-                    f"首次开启需要在防火墙放行 TCP 端口 {port}\n"
+                    f"首次开启需要在防火墙放行 TCP 端口 {port} 和 {socks_port}\n"
                     "（会弹出管理员确认窗口，请选“是”；只对本机所在子网放行）。\n现在添加吗？",
                     parent=self.root):
                 self._fw_pending = False
                 self._set_share_status(self._share_off_text(port))
                 return
             self._set_share_status("正在添加防火墙规则…请在弹出的窗口点“是”")
-            threading.Thread(target=self._fw_then_start, args=(up, lan, port), daemon=True).start()
+            threading.Thread(target=self._fw_then_start,
+                             args=(up, lan, port, socks_port), daemon=True).start()
 
         self._ui(proceed)
 
-    def _fw_then_start(self, up, lan, port):
-        ok = add_firewall_rule_elevated(port)
+    def _fw_then_start(self, up, lan, port, socks_port):
+        # 只加缺失的规则（netsh 同名重复添加会留重复条目）
+        rules = [(p, s) for p, s in ((port, False), (socks_port, True))
+                 if not firewall_rule_exists(p, socks=s)]
+        ok = add_firewall_rule_elevated(rules) if rules else True
         rule_ok = False
         for _ in range(8):  # netsh 是异步的，等规则真正写入（最多约 3 秒）
             if not ok:  # UAC 被取消/失败，别再白跑 8 轮 netsh
                 break
-            rule_ok = firewall_rule_exists(port)
+            rule_ok = (firewall_rule_exists(port)
+                       and firewall_rule_exists(socks_port, socks=True))
             if rule_ok:
                 break
             time.sleep(0.4)
 
         def finish():
-            if port != self.share_port:
+            if (port, socks_port) != (self.share_port, self.socks_port):
                 # 等 UAC/写规则期间端口又被改了：这条规则已对不上号，用新端口重来一轮
                 self._restart_fw_check(lan)
                 return
@@ -1092,7 +1389,16 @@ class ProxyApp:
             self._fw_pending = False  # 失败要解锁，否则之后点开启都被"进行中"挡住
             self._set_share_status(f"✗ 开启失败：{e}", color="#c62828")
             return
-        self._relay = relay
+        try:
+            socks = SocksServer(self.socks_port, up,
+                                self.settings["socks_user"], self.settings["socks_pass"])
+            socks.start()
+        except OSError as e:
+            relay.stop()  # HTTP 通道起来了也得退回，两通道同进同退
+            self._fw_pending = False
+            self._set_share_status(f"✗ SOCKS5 端口 {self.socks_port} 开启失败：{e}", color="#c62828")
+            return
+        self._relay, self._socks = relay, socks
         self._lan_hint = lan or self._lan_hint  # 用刚探测到的 IP，别用过期缓存
         self.share_btn.config(text="停止共享")
         self._share_cfg = True
@@ -1112,14 +1418,15 @@ class ProxyApp:
         threading.Thread(target=self._restore_worker, args=(up,), daemon=True).start()
 
     def _restore_worker(self, up):
-        port = self.share_port
-        has_rule = firewall_rule_exists(port)
+        port, socks_port = self.share_port, self.socks_port
+        has_rule = (firewall_rule_exists(port)
+                    and firewall_rule_exists(socks_port, socks=True))
 
         def finish():
             self._fw_pending = False
-            if self._relay:  # 恢复期间用户已手动开启，再开就撞端口（假报错）
+            if self._relay or self._socks:  # 恢复期间用户已手动开启，再开就撞端口（假报错）
                 return
-            if port != self.share_port:  # 期间改了端口，这条检查结果已过时
+            if (port, socks_port) != (self.share_port, self.socks_port):  # 期间改了端口，检查已过时
                 self._set_share_status(
                     "共享端口已改动，没有自动恢复，请重新点“开启共享”", color="#c62828")
                 return
@@ -1152,9 +1459,21 @@ class ProxyApp:
         port_var = tk.StringVar(value=str(self.share_port))
         ttk.Entry(frm, textvariable=port_var, width=12).grid(row=0, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="配置文件路径").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="SOCKS5 端口").grid(row=1, column=0, sticky="e", **pad)
+        socks_var = tk.StringVar(value=str(self.socks_port))
+        ttk.Entry(frm, textvariable=socks_var, width=12).grid(row=1, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="SOCKS5 用户名").grid(row=2, column=0, sticky="e", **pad)
+        user_var = tk.StringVar(value=self.settings["socks_user"])
+        ttk.Entry(frm, textvariable=user_var, width=12).grid(row=2, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="SOCKS5 密码").grid(row=3, column=0, sticky="e", **pad)
+        pass_var = tk.StringVar(value=self.settings["socks_pass"])
+        ttk.Entry(frm, textvariable=pass_var, width=12, show="*").grid(row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="配置文件路径").grid(row=4, column=0, sticky="e", **pad)
         path_var = tk.StringVar(value=self.settings["config_path"] or CONFIG_FILE)
-        ttk.Entry(frm, textvariable=path_var, width=36).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=path_var, width=36).grid(row=4, column=1, sticky="w", **pad)
 
         def browse():
             picked = filedialog.asksaveasfilename(
@@ -1163,18 +1482,25 @@ class ProxyApp:
             if picked:
                 path_var.set(os.path.normpath(picked))
 
-        ttk.Button(frm, text="浏览", command=browse).grid(row=1, column=2, padx=(0, 8))
+        ttk.Button(frm, text="浏览", command=browse).grid(row=4, column=2, padx=(0, 8))
 
-        ttk.Label(frm, text="切换路径时会把当前配置复制到新位置；\n改了共享端口后需重新点一次“开启共享”。",
-                 foreground="#888", justify="left").grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(frm, text="切换路径时会把当前配置复制到新位置；\n改了任一端口或 SOCKS5 认证后需重新点一次“开启共享”；\nSOCKS5 用户名/密码留空 = 无认证。",
+                 foreground="#888", justify="left").grid(row=5, column=0, columnspan=3, sticky="w", **pad)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, columnspan=3, pady=(2, 8))
+        btns.grid(row=6, column=0, columnspan=3, pady=(2, 8))
 
         def on_save():
             port = self._parse_port(port_var.get())
             if port is None:
                 messagebox.showwarning("提示", "共享端口需为 1-65535 的数字", parent=win)
+                return
+            socks_port = self._parse_port(socks_var.get())
+            if socks_port is None:
+                messagebox.showwarning("提示", "SOCKS5 端口需为 1-65535 的数字", parent=win)
+                return
+            if socks_port == port:
+                messagebox.showwarning("提示", "SOCKS5 端口不能和共享端口相同", parent=win)
                 return
             new_path = self._normalize_config_path(path_var.get())
             old_path = self.settings["config_path"] or CONFIG_FILE
@@ -1182,27 +1508,35 @@ class ProxyApp:
             if changed and os.path.exists(new_path):
                 if not messagebox.askyesno("提示", "新路径已有配置文件，用当前配置覆盖它？", parent=win):
                     return
-            port_changed = port != self.share_port
-            new_settings = {"share_port": port,
+            port_changed = (port != self.share_port or socks_port != self.socks_port
+                            or user_var.get().strip() != self.settings["socks_user"]
+                            or pass_var.get() != self.settings["socks_pass"])
+            new_settings = {"share_port": port, "socks_port": socks_port,
+                            "socks_user": user_var.get().strip(),
+                            "socks_pass": pass_var.get(),
                             "config_path": new_path if changed else old_path}
             try:
                 save_settings(new_settings)
             except OSError as e:
                 messagebox.showerror("错误", f"保存设置失败：\n{e}", parent=win)
                 return  # 写盘失败就别动内存状态，免得界面和文件分叉
-            self.share_port = port
+            self.share_port, self.socks_port = port, socks_port
             self.settings = new_settings
             if changed:
                 self.save_preset()  # 立刻把当前配置写到新位置
             if port_changed:
-                if self._relay:  # 端口变了，旧监听作废
-                    self._relay.stop()
-                    self._relay = None
+                if self._relay or self._socks:  # 端口/认证变了，旧监听作废
+                    if self._relay:
+                        self._relay.stop()
+                        self._relay = None
+                    if self._socks:
+                        self._socks.stop()
+                        self._socks = None
                     self.share_btn.config(text="开启共享")
                     self._share_cfg = False  # 共享已停，别把"开着"残留进配置
                     self.save_preset()
                     self._set_share_status(
-                        f"共享端口已改为 {self.share_port}，请重新点“开启共享”", color="#c62828")
+                        "共享端口/SOCKS5 设置已改动，请重新点“开启共享”", color="#c62828")
                 else:
                     self._set_share_status(self._share_off_text())
             win.destroy()
@@ -1264,8 +1598,8 @@ class ProxyApp:
             if not win.winfo_exists():
                 return
             tv.delete(*tv.get_children())
-            if self._relay:
-                conns, devs = self._relay.snapshot()
+            if self._relay or self._socks:
+                conns, devs = self._share_snapshot()
                 for ip, c, sec in devs:
                     tv.insert("", "end", values=(ip, c, f"{sec} 秒前"))
                 n_dev = sum(1 for _, _, sec in devs if sec <= ACTIVE_WINDOW_SEC)
@@ -1342,6 +1676,8 @@ class ProxyApp:
             self._exit_add_mode(restore=True)
         if self._relay:
             self._relay.stop()  # 只停转发；共享开关状态保留，下次启动自动恢复
+        if self._socks:
+            self._socks.stop()
         self.save_preset()
         if self._tray:
             try:
