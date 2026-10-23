@@ -668,8 +668,8 @@ class ProxyApp:
         self.port_var.trace_add("write", self._on_addr_changed)
 
         self.status_var = tk.StringVar()
-        tk.Label(frm, textvariable=self.status_var, fg="#555").grid(
-            row=3, column=0, columnspan=2, **pad)
+        self.status_label = tk.Label(frm, textvariable=self.status_var, fg="#555")
+        self.status_label.grid(row=3, column=0, columnspan=2, **pad)
 
         self.btn = tk.Button(frm, width=18, command=self.toggle)
         self.btn.grid(row=4, column=0, columnspan=2, ipady=4, padx=12, pady=(2, 4))
@@ -682,14 +682,17 @@ class ProxyApp:
         self.test_result_label.grid(row=5, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
         self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
 
+        ttk.Separator(frm).grid(row=6, column=0, columnspan=2,
+                                sticky="ew", padx=12, pady=(2, 2))  # 主功能/辅助设置分区
+
         self.autostart_var = tk.BooleanVar(value=get_autostart())
         tk.Checkbutton(frm, text="开机自动启动", variable=self.autostart_var,
                        command=self.toggle_autostart).grid(
-            row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
+            row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
 
-        tk.Label(frm, text="局域网共享").grid(row=7, column=0, sticky="e", **pad)
+        tk.Label(frm, text="局域网共享").grid(row=8, column=0, sticky="e", **pad)
         share_frm = tk.Frame(frm)
-        share_frm.grid(row=7, column=1, sticky="w", **pad)
+        share_frm.grid(row=8, column=1, sticky="w", **pad)
         self.share_btn = tk.Button(share_frm, text="开启共享", width=8, command=self.toggle_share)
         self.share_btn.pack(side="left")
         tk.Button(share_frm, text="设置…", width=6, command=self.open_settings).pack(side="left", padx=(6, 0))
@@ -697,7 +700,7 @@ class ProxyApp:
         self.share_status_var = tk.StringVar()
         self.share_status_label = tk.Label(frm, textvariable=self.share_status_var, fg="#555",
                                            justify="left", anchor="w")
-        self.share_status_label.grid(row=8, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
+        self.share_status_label.grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
         self._set_share_status(self._share_off_text())
 
         self._auto_refresh()  # 每 2 秒重读注册表，窗口状态始终跟系统一致
@@ -848,10 +851,12 @@ class ProxyApp:
     def refresh_status(self):
         self.enabled, server = get_system_proxy()
         if self.enabled:
-            self.status_var.set(f"当前状态：已开启（{server}）")
+            self.status_var.set(f"● 已开启  {server}")
+            self.status_label.config(fg="#1a7f37")
             self.btn.config(text="关闭代理", bg="#ffd7d7")
         else:
-            self.status_var.set("当前状态：已关闭")
+            self.status_var.set("● 已关闭")
+            self.status_label.config(fg="#555")
             self.btn.config(text="开启代理", bg="#d7f0d7")
 
     @staticmethod
