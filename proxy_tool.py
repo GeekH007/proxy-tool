@@ -647,8 +647,6 @@ class ProxyApp:
         self.save_preset_btn = tk.Button(preset_frm, text="新增", width=6,
                                          command=self.on_add_or_save)
         self.save_preset_btn.pack(side="left", padx=(4, 0))
-        self.cancel_add_btn = tk.Button(preset_frm, text="取消", width=3,
-                                        command=self._cancel_add_mode)  # 仅新增模式出现
         self.delete_preset_btn = tk.Button(preset_frm, text="删除", width=3,
                                            command=self.delete_preset)
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
@@ -783,17 +781,18 @@ class ProxyApp:
         self.preset_var.set("")  # 名字也清空（留空保存时自动用 ip:端口 当名字）
         self.ip_var.set("")
         self.port_var.set("")    # 置空即触发 trace：红框复位、旧测试结果作废
-        for w in (self.btn, self.share_btn, self.delete_preset_btn):
-            w.config(state="disabled")  # 半成品地址不能应用/共享，也不许动删除
-        self.cancel_add_btn.pack(side="left", padx=(4, 0), before=self.delete_preset_btn)
+        for w in (self.btn, self.share_btn):
+            w.config(state="disabled")  # 半成品地址不能应用/共享
+        # 「删除」临时变「取消」：不新增按钮，布局零变化（删除在新增模式里本来就不可用）
+        self.delete_preset_btn.config(text="取消", command=self._cancel_add_mode)
         self.save_preset_btn.config(text="存预设")
         self.ip_entry.focus_set()
 
     def _exit_add_mode(self, restore: bool):
         self._adding = False
-        self.cancel_add_btn.pack_forget()
         self.save_preset_btn.config(text="新增")
-        for w in (self.btn, self.share_btn, self.delete_preset_btn):
+        self.delete_preset_btn.config(text="删除", command=self.delete_preset)
+        for w in (self.btn, self.share_btn):
             w.config(state="normal")
         if restore:  # 取消/退出：还原进来之前的样子，别把半成品留下
             name, ip, port = self._add_backup
