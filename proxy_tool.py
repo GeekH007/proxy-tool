@@ -985,7 +985,8 @@ class ProxyApp:
         ttk.Button(share_frm, text="客户端", width=6, command=self.open_clients).pack(side="left", padx=(6, 0))
         self.share_status_var = tk.StringVar()
         self.share_status_label = ttk.Label(frm, textvariable=self.share_status_var, foreground="#555",
-                                           justify="left", anchor="w")
+                                           justify="left", anchor="w",
+                                           wraplength=300)  # 共享中的双通道长文案折行，别撑宽窗口
         self.share_status_label.grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
         self._set_share_status(self._share_off_text())
 
