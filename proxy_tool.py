@@ -930,11 +930,12 @@ class ProxyApp:
                                        values=[p["name"] for p in self.presets])
         self.preset_box.pack(side="left")
         self.preset_box.bind("<<ComboboxSelected>>", self.on_preset_selected)
-        self.save_preset_btn = ttk.Button(preset_frm, text="新增", width=6,
-                                         command=self.on_add_or_save)
+        # padding 压到与输入框同高（clam 默认 padding=5 会让按钮比 23px 的 Combobox 胖一圈）
+        self.save_preset_btn = ttk.Button(preset_frm, text="新增", width=6, padding=(5, 0),
+                                          command=self.on_add_or_save)
         self.save_preset_btn.pack(side="left", padx=(4, 0))
-        self.delete_preset_btn = ttk.Button(preset_frm, text="删除", width=3,
-                                           command=self.delete_preset)
+        self.delete_preset_btn = ttk.Button(preset_frm, text="删除", width=4, padding=(5, 0),
+                                            command=self.delete_preset)
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
         ttk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
