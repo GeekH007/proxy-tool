@@ -614,6 +614,7 @@ class ProxyApp:
         root.title(APP_TITLE)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<Escape>", lambda _e: self._cancel_add_mode() if self._adding else None)
 
         self.settings = load_settings()
         self.share_port = self.settings["share_port"]
@@ -623,6 +624,7 @@ class ProxyApp:
         self._tray_hinted = False  # "已藏到托盘"的气泡每次运行只提示一次
         self._fw_pending = False  # 正在等 UAC/防火墙规则写入，期间忽略重复点击
         self._test_gen = 0        # 测试轮次：地址变更后旧结果（含在途）作废
+        self._adding = False      # 「新增」模式：填新预设期间，开关/共享/删除暂禁用
         self._ui_queue = queue.Queue()  # 工作线程→主线程的 UI 任务队列
         self._pump_ui_queue()
         cfg = load_config(self.settings["config_path"])
@@ -642,10 +644,14 @@ class ProxyApp:
                                        values=[p["name"] for p in self.presets])
         self.preset_box.pack(side="left")
         self.preset_box.bind("<<ComboboxSelected>>", self.on_preset_selected)
-        self.save_preset_btn = tk.Button(preset_frm, text="存预设", width=6,
-                                         command=self.save_preset_clicked)
+        self.save_preset_btn = tk.Button(preset_frm, text="新增", width=6,
+                                         command=self.on_add_or_save)
         self.save_preset_btn.pack(side="left", padx=(4, 0))
-        tk.Button(preset_frm, text="删除", width=3, command=self.delete_preset).pack(side="left", padx=(4, 0))
+        self.cancel_add_btn = tk.Button(preset_frm, text="取消", width=3,
+                                        command=self._cancel_add_mode)  # 仅新增模式出现
+        self.delete_preset_btn = tk.Button(preset_frm, text="删除", width=3,
+                                           command=self.delete_preset)
+        self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
         tk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
         self.ip_var = tk.StringVar(value=self._current_preset()["ip"])
@@ -658,7 +664,8 @@ class ProxyApp:
         self.port_entry.grid(row=2, column=1, sticky="w", **pad)
         # 回车=应用并开启，只绑输入框：绑 root 会把删除按钮/下拉框上的回车也误触成开代理
         for ent in (self.ip_entry, self.port_entry):
-            ent.bind("<Return>", lambda _e: self.apply(True))
+            # 回车=应用；新增模式里回车=存预设（禁用的大开关挡不住键盘事件）
+            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding else self.apply(True))
         self.ip_var.trace_add("write", self._on_addr_changed)    # 编辑即校验+作废旧测试结果
         self.port_var.trace_add("write", self._on_addr_changed)
 
@@ -716,6 +723,8 @@ class ProxyApp:
         return self.presets[0]
 
     def on_preset_selected(self, _event=None):
+        if self._adding:  # 新增模式里改选预设 = 放弃新增，恢复按钮
+            self._exit_add_mode(restore=False)
         p = self._current_preset()
         self.ip_var.set(p["ip"])
         self.port_var.set(p["port"])
@@ -760,12 +769,41 @@ class ProxyApp:
             return False
         return True
 
-    def save_preset_clicked(self):
-        """「存预设」按钮：不等开启代理，立即把当前名字+地址端口落盘（名字新的就新增）"""
-        if self.save_preset():
-            btn = self.save_preset_btn
-            btn.config(text="✓ 已存")
-            self.root.after(1200, lambda: btn.config(text="存预设"))
+    def on_add_or_save(self):
+        """按钮双态：常态「新增」进入新增模式；新增模式「存预设」校验+落盘并退出"""
+        if self._adding:
+            if self._valid_inputs() and self.save_preset():
+                self._exit_add_mode(restore=False)
+        else:
+            self._enter_add_mode()
+
+    def _enter_add_mode(self):
+        self._adding = True
+        self._add_backup = (self.preset_var.get(), self.ip_var.get(), self.port_var.get())
+        self.preset_var.set("")  # 名字也清空（留空保存时自动用 ip:端口 当名字）
+        self.ip_var.set("")
+        self.port_var.set("")    # 置空即触发 trace：红框复位、旧测试结果作废
+        for w in (self.btn, self.share_btn, self.delete_preset_btn):
+            w.config(state="disabled")  # 半成品地址不能应用/共享，也不许动删除
+        self.cancel_add_btn.pack(side="left", padx=(4, 0), before=self.delete_preset_btn)
+        self.save_preset_btn.config(text="存预设")
+        self.ip_entry.focus_set()
+
+    def _exit_add_mode(self, restore: bool):
+        self._adding = False
+        self.cancel_add_btn.pack_forget()
+        self.save_preset_btn.config(text="新增")
+        for w in (self.btn, self.share_btn, self.delete_preset_btn):
+            w.config(state="normal")
+        if restore:  # 取消/退出：还原进来之前的样子，别把半成品留下
+            name, ip, port = self._add_backup
+            self.preset_var.set(name)
+            self.ip_var.set(ip)
+            self.port_var.set(port)
+        self._sync_relay_upstream()
+
+    def _cancel_add_mode(self):
+        self._exit_add_mode(restore=True)
 
     def _sync_preset_box(self):
         self.preset_box.config(values=[p["name"] for p in self.presets])
@@ -1281,6 +1319,8 @@ class ProxyApp:
         """真正退出（托盘菜单的“退出”）：停转发、存配置、摘掉托盘图标。
         只 quit 不 destroy——destroy . 销毁窗口但**不会终止 mainloop**，进程会
         空转残活（实测踩过）；mainloop 由 quit 终止，窗口由 __main__ 统一销毁"""
+        if self._adding:  # 新增模式里退出：先还原字段，别把半成品存成预设
+            self._exit_add_mode(restore=True)
         if self._relay:
             self._relay.stop()  # 只停转发；共享开关状态保留，下次启动自动恢复
         self.save_preset()
