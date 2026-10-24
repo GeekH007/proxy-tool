@@ -1056,6 +1056,16 @@ def _to_addr_pairs(upstreams: list) -> list:
     return out
 
 
+def validate_upstreams(pairs: list):
+    """开代理前的池门槛校验：可用返回 None，否则返回人话错误（空池/坏条目都拦）"""
+    if not pairs:
+        return "上游池为空，请先添加至少一台上游"
+    for ip, port in pairs:
+        if not _valid_upstream(ip, str(port)):
+            return f"上游 {ip}:{port} 格式不对（地址需 IP/主机名，端口 1-65535）"
+    return None
+
+
 def _normalize(data) -> dict:
     """把任意版本的配置统一成 {"current": 名称, "share": bool,
     "presets": [{"name": 名, "upstreams": [[ip, 端口], ...]}]}。
@@ -1214,49 +1224,71 @@ class ProxyApp:
                                             command=self.delete_preset)
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
-        ttk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
-        _up0 = self._current_preset()["upstreams"][0]  # 输入框先显示池[0]，Task 5 改造为「添加上游」用途
-        self.ip_var = tk.StringVar(value=_up0[0])
+        ttk.Label(frm, text="上游地址").grid(row=1, column=0, sticky="e", **pad)
+        self.ip_var = tk.StringVar()   # 输入框是「添加上游」的入口，平时留空
         self.ip_entry = ttk.Entry(frm, textvariable=self.ip_var, width=22)
         self.ip_entry.grid(row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="代理端口").grid(row=2, column=0, sticky="e", **pad)
-        self.port_var = tk.StringVar(value=_up0[1])
-        self.port_entry = ttk.Entry(frm, textvariable=self.port_var, width=22)
-        self.port_entry.grid(row=2, column=1, sticky="w", **pad)
-        # 回车=应用并开启，只绑输入框：绑 root 会把删除按钮/下拉框上的回车也误触成开代理
+        ttk.Label(frm, text="上游端口").grid(row=2, column=0, sticky="e", **pad)
+        port_frm = ttk.Frame(frm)
+        port_frm.grid(row=2, column=1, sticky="w", **pad)
+        self.port_var = tk.StringVar()
+        self.port_entry = ttk.Entry(port_frm, textvariable=self.port_var, width=15)
+        self.port_entry.pack(side="left")
+        self.add_up_btn = ttk.Button(port_frm, text="添加", width=6, padding=(5, 0),
+                                     command=self.add_upstream)
+        self.add_up_btn.pack(side="left", padx=(4, 0))
+        # 回车=添加上游：只绑输入框，防误触大开关；新增模式里回车仍=存预设
         for ent in (self.ip_entry, self.port_entry):
-            # 回车=应用；新增模式里回车=存预设（禁用的大开关挡不住键盘事件）
-            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding else self.apply(True))
+            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding else self.add_upstream())
         self.ip_var.trace_add("write", self._on_addr_changed)    # 编辑即校验+作废旧测试结果
         self.port_var.trace_add("write", self._on_addr_changed)
 
+        # 上游池一览：选中可移除（至少保留一台）；入口运行中每台分流各走各的
+        pool_frm = ttk.Frame(frm)
+        pool_frm.grid(row=3, column=1, sticky="w", **pad)
+        self.pool_box = ttk.Treeview(pool_frm, columns=("up",), show="headings", height=3,
+                                      selectmode="browse")
+        self.pool_box.heading("up", text="上游池（按连接分流）")
+        self.pool_box.column("up", width=170, anchor="w")
+        self.pool_box.pack(side="left")
+        ttk.Button(pool_frm, text="移除", width=6, padding=(5, 0),
+                   command=self.remove_upstream).pack(side="left", padx=(6, 0), anchor="n")
+
         self.status_var = tk.StringVar()
         self.status_label = ttk.Label(frm, textvariable=self.status_var, foreground="#555")
-        self.status_label.grid(row=3, column=0, columnspan=2, **pad)
+        self.status_label.grid(row=4, column=0, columnspan=2, **pad)
+
+        # 入口运行中：每台上游的 连接数/速率 分列（2 秒差分，与共享状态行同款）
+        self.up_status_var = tk.StringVar()
+        self.up_status_label = ttk.Label(frm, textvariable=self.up_status_var, foreground="#555",
+                                         justify="left", anchor="w", wraplength=300)
+        self.up_status_label.grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 2))
+        self._up_bytes_prev = {}   # 上游 -> (t, 下行, 上行) 差分采样
 
         self.btn = ttk.Button(frm, width=18, command=self.toggle)
-        self.btn.grid(row=4, column=0, columnspan=2, ipady=4, padx=12, pady=(2, 4))
+        self.btn.grid(row=6, column=0, columnspan=2, ipady=4, padx=12, pady=(2, 4))
 
         self.test_btn = ttk.Button(frm, text="测试连通", width=8, command=self.test_connectivity)
-        self.test_btn.grid(row=5, column=0, sticky="w", padx=(12, 4), pady=(0, 6))
+        self.test_btn.grid(row=7, column=0, sticky="w", padx=(12, 4), pady=(0, 6))
         self.test_result_var = tk.StringVar()
         self.test_result_label = ttk.Label(frm, textvariable=self.test_result_var, foreground="#555",
                                           wraplength=300)  # 长错误文本折行，别撑宽定宽窗口
-        self.test_result_label.grid(row=5, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
+        self.test_result_label.grid(row=7, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
         self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
+        self._refresh_pool_box()
 
-        ttk.Separator(frm).grid(row=6, column=0, columnspan=2,
+        ttk.Separator(frm).grid(row=8, column=0, columnspan=2,
                                 sticky="ew", padx=12, pady=(2, 2))  # 主功能/辅助设置分区
 
         self.autostart_var = tk.BooleanVar(value=get_autostart())
         ttk.Checkbutton(frm, text="开机自动启动", variable=self.autostart_var,
                        command=self.toggle_autostart).grid(
-            row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
+            row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
 
-        ttk.Label(frm, text="局域网共享").grid(row=8, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="局域网共享").grid(row=10, column=0, sticky="e", **pad)
         share_frm = ttk.Frame(frm)
-        share_frm.grid(row=8, column=1, sticky="w", **pad)
+        share_frm.grid(row=10, column=1, sticky="w", **pad)
         self.share_btn = ttk.Button(share_frm, text="开启共享", width=8, command=self.toggle_share)
         self.share_btn.pack(side="left")
         ttk.Button(share_frm, text="设置", width=4, command=self.open_settings).pack(side="left", padx=(6, 0))
@@ -1265,7 +1297,7 @@ class ProxyApp:
         self.share_status_label = ttk.Label(frm, textvariable=self.share_status_var, foreground="#555",
                                            justify="left", anchor="w",
                                            wraplength=300)  # 共享中的双通道长文案折行，别撑宽窗口
-        self.share_status_label.grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
+        self.share_status_label.grid(row=11, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
         self._set_share_status(self._share_off_text())
 
         self._auto_refresh()  # 每 2 秒重读注册表，窗口状态始终跟系统一致
@@ -1291,11 +1323,52 @@ class ProxyApp:
     def on_preset_selected(self, _event=None):
         if self._adding:  # 新增模式里改选预设 = 放弃新增，恢复按钮
             self._exit_add_mode(restore=False)
-        p = self._current_preset()
-        up0 = p["upstreams"][0]
-        self.ip_var.set(up0[0])
-        self.port_var.set(up0[1])
+        self.ip_var.set("")   # 输入框是添加用途，切预设清空防误加
+        self.port_var.set("")
+        self._refresh_pool_box()
         self._sync_relay_upstream()
+
+    # ---- 上游池 ----
+
+    def _refresh_pool_box(self):
+        """池列表跟随当前预设重画；iid 用索引，移除时好对位"""
+        self.pool_box.delete(*self.pool_box.get_children())
+        for i, (ip, port) in enumerate(self._pool_addrs()):
+            self.pool_box.insert("", "end", iid=str(i), values=(f"{ip}:{port}",))
+
+    def add_upstream(self):
+        """把输入框的地址端口加进当前预设的池（重复的不加），入口热切新连接生效"""
+        ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
+        if not _valid_upstream(ip, port):
+            messagebox.showwarning("提示", "请填写正确的上游地址（IP 或主机名）和端口（1-65535）",
+                                   parent=self.root)
+            return
+        cur = self._current_preset()
+        if [ip, port] not in cur["upstreams"]:
+            cur["upstreams"].append([ip, port])
+        self.ip_var.set("")
+        self.port_var.set("")
+        self._test_gen += 1          # 池变了，旧测试结果作废
+        self.test_result_var.set("")
+        self._refresh_pool_box()
+        self._sync_pools()
+        self.save_preset()
+
+    def remove_upstream(self):
+        """移除池中选中的一台；最后一家不许删（删空就没法分流了）"""
+        sel = self.pool_box.selection()
+        if not sel:
+            return
+        cur = self._current_preset()
+        if len(cur["upstreams"]) <= 1:
+            messagebox.showinfo("提示", "至少要保留一台上游", parent=self.root)
+            return
+        del cur["upstreams"][int(sel[0])]
+        self._test_gen += 1
+        self.test_result_var.set("")
+        self._refresh_pool_box()
+        self._sync_pools()
+        self.save_preset()
 
     def delete_preset(self):
         if len(self.presets) <= 1:
@@ -1309,16 +1382,17 @@ class ProxyApp:
         self.presets = rest
         first = self.presets[0]
         self.preset_var.set(first["name"])
-        up0 = first["upstreams"][0]
-        self.ip_var.set(up0[0])
-        self.port_var.set(up0[1])
+        self.ip_var.set("")
+        self.port_var.set("")
         self._sync_preset_box()
+        self._refresh_pool_box()
         self._sync_relay_upstream()  # 共享运行中也要跟上切换后的地址
         self.save_preset()
 
-    def save_preset(self) -> bool:
-        """把当前上游组存进当前名字的预设（名字是新的则新建）。返回是否落盘成功"""
-        ups = [[ip, str(port)] for ip, port in self._pool_addrs()]
+    def save_preset(self, ups=None) -> bool:
+        """把上游组存进当前名字的预设（名字是新的则新建）；ups 缺省=当前池。返回是否落盘成功"""
+        if ups is None:
+            ups = [[ip, str(port)] for ip, port in self._pool_addrs()]
         name = self.preset_var.get().strip()
         if not name:
             first = ups[0] if ups else ["", ""]
@@ -1341,8 +1415,11 @@ class ProxyApp:
     def on_add_or_save(self):
         """按钮双态：常态「新增」进入新增模式；新增模式「存预设」校验+落盘并退出"""
         if self._adding:
-            if self._valid_inputs() and self.save_preset():
-                self._exit_add_mode(restore=False)
+            if self._valid_inputs():
+                ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
+                if self.save_preset([[ip, port]]):  # 新预设从输入框这一台起步
+                    self._refresh_pool_box()
+                    self._exit_add_mode(restore=False)
         else:
             self._enter_add_mode()
 
@@ -1457,6 +1534,26 @@ class ProxyApp:
             self.status_var.set("● 已关闭")
             self.status_label.config(foreground="#555")
             self.btn.config(text="开启代理", style="Off.TButton")
+        self._entry_status_text()
+
+    def _entry_status_text(self):
+        """入口分列状态：每台上游 连接数 + 2 秒差分速率；入口没跑就清空该行"""
+        if not self._entry:
+            self.up_status_var.set("")
+            return
+        _, stats = self._entry.snapshot()
+        now = time.monotonic()
+        parts = []
+        for up, (c, bd, bu) in stats.items():
+            prev = self._up_bytes_prev.get(up)
+            self._up_bytes_prev[up] = (now, bd, bu)
+            if prev and bd >= prev[1] and bu >= prev[2] and now > prev[0]:
+                dt = now - prev[0]
+                parts.append(f"{up[0]}:{up[1]} ↓{_fmt_speed((bd - prev[1]) / dt)} "
+                             f"↑{_fmt_speed((bu - prev[2]) / dt)} {c}连")
+            else:  # 首次见到或入口重启计数清零：先给基点，下轮出速率
+                parts.append(f"{up[0]}:{up[1]} {c}连")
+        self.up_status_var.set("  ｜  ".join(parts))
 
     @staticmethod
     def _parse_port(text: str):
@@ -1521,9 +1618,9 @@ class ProxyApp:
     def apply(self, enable: bool):
         if enable:
             addrs = self._pool_addrs()
-            if not addrs:
-                messagebox.showwarning("提示", "上游池为空，请先在预设里配置上游",
-                                       parent=self.root)
+            err = validate_upstreams(addrs)  # 空池/坏条目都拦，注册表不写
+            if err:
+                messagebox.showwarning("提示", err, parent=self.root)
                 return
             self._pool.set(addrs)
             if self._entry is None:  # 入口只在缺时起；改入口端口后重开一次开关生效
@@ -1562,17 +1659,21 @@ class ProxyApp:
             messagebox.showerror("错误", f"设置开机自启失败：\n{e}", parent=self.root)
 
     def test_connectivity(self):
-        """走当前填写的代理请求 generate_204，后台线程执行避免卡界面"""
-        if not self._valid_inputs():
+        """对池内每台上游逐台请求 generate_204，分列显示结果"""
+        addrs = self._pool_addrs()
+        if not addrs:
+            messagebox.showwarning("提示", "上游池为空，请先添加上游", parent=self.root)
             return
-        ip, port = self.ip_var.get().strip(), int(self.port_var.get().strip())
         self.test_btn.config(state="disabled", text="测试中…")
         self.test_result_var.set("正在测试…")
         self.test_result_label.config(foreground="#555")
         gen = self._test_gen
-        threading.Thread(target=self._test_worker, args=(ip, port, gen), daemon=True).start()
+        self._test_results = {}   # "ip:port" -> (ok, 文本)，收齐 total 条才恢复按钮
+        for ip, port in addrs:
+            threading.Thread(target=self._test_worker, args=(ip, port, gen, len(addrs)),
+                             daemon=True).start()
 
-    def _test_worker(self, ip: str, port: int, gen: int):
+    def _test_worker(self, ip: str, port: int, gen: int, total: int):
         proxies = {"http": f"http://{ip}:{port}", "https": f"http://{ip}:{port}"}
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
         start = time.perf_counter()
@@ -1580,21 +1681,23 @@ class ProxyApp:
             opener.open(TEST_URL, timeout=3)
         except Exception as e:  # 超时、拒绝连接等统一按失败展示
             reason = getattr(e, "reason", None) or e
-            self._ui(lambda: self._show_test_result(gen, False, _friendly_conn_error(reason)))
+            ok, info = False, _friendly_conn_error(reason)
         else:
-            ms = round((time.perf_counter() - start) * 1000)
-            self._ui(lambda: self._show_test_result(gen, True, f"{ms} ms"))
+            ok, info = True, f"{round((time.perf_counter() - start) * 1000)} ms"
+        self._ui(lambda: self._show_test_result(gen, f"{ip}:{port}", ok, info, total))
 
-    def _show_test_result(self, gen: int, ok: bool, info: str):
-        self.test_btn.config(state="normal", text="测试连通")
-        if gen != self._test_gen:  # 结果到达前地址已被改动：只恢复按钮，结果丢弃
+    def _show_test_result(self, gen: int, name: str, ok: bool, info: str, total: int):
+        if gen != self._test_gen:  # 结果到达前池已被改动：丢弃（按钮由收齐的末条恢复）
             return
-        if ok:
-            self.test_result_var.set(f"✓ 连通（{info}）")
-            self.test_result_label.config(foreground="#1a7f37")
-        else:
-            self.test_result_var.set(f"✗ 失败：{info}")
-            self.test_result_label.config(foreground="#c62828")
+        self._test_results[name] = (ok, info)
+        if len(self._test_results) < total:
+            return
+        self.test_btn.config(state="normal", text="测试连通")
+        self.test_result_var.set(" ｜ ".join(f"{n} {'✓' if ok else '✗'} {t}"
+                                             for n, (ok, t) in self._test_results.items()))
+        self.test_result_label.config(foreground="#1a7f37"
+                                      if all(ok for ok, _ in self._test_results.values())
+                                      else "#c62828")
 
     # ---- 局域网共享 ----
 
@@ -1774,25 +1877,29 @@ class ProxyApp:
         frm.pack(padx=14, pady=10)
         pad = {"padx": 8, "pady": 5}
 
-        ttk.Label(frm, text="共享监听端口").grid(row=0, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="入口端口").grid(row=0, column=0, sticky="e", **pad)
+        entry_var = tk.StringVar(value=str(self.entry_port))
+        ttk.Entry(frm, textvariable=entry_var, width=12).grid(row=0, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="共享监听端口").grid(row=1, column=0, sticky="e", **pad)
         port_var = tk.StringVar(value=str(self.share_port))
-        ttk.Entry(frm, textvariable=port_var, width=12).grid(row=0, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=port_var, width=12).grid(row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="SOCKS5 端口").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="SOCKS5 端口").grid(row=2, column=0, sticky="e", **pad)
         socks_var = tk.StringVar(value=str(self.socks_port))
-        ttk.Entry(frm, textvariable=socks_var, width=12).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=socks_var, width=12).grid(row=2, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="SOCKS5 用户名").grid(row=2, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="SOCKS5 用户名").grid(row=3, column=0, sticky="e", **pad)
         user_var = tk.StringVar(value=self.settings["socks_user"])
-        ttk.Entry(frm, textvariable=user_var, width=12).grid(row=2, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=user_var, width=12).grid(row=3, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="SOCKS5 密码").grid(row=3, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="SOCKS5 密码").grid(row=4, column=0, sticky="e", **pad)
         pass_var = tk.StringVar(value=self.settings["socks_pass"])
-        ttk.Entry(frm, textvariable=pass_var, width=12, show="*").grid(row=3, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=pass_var, width=12, show="*").grid(row=4, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="配置文件路径").grid(row=4, column=0, sticky="e", **pad)
+        ttk.Label(frm, text="配置文件路径").grid(row=5, column=0, sticky="e", **pad)
         path_var = tk.StringVar(value=self.settings["config_path"] or CONFIG_FILE)
-        ttk.Entry(frm, textvariable=path_var, width=36).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=path_var, width=36).grid(row=5, column=1, sticky="w", **pad)
 
         def browse():
             picked = filedialog.asksaveasfilename(
@@ -1801,15 +1908,19 @@ class ProxyApp:
             if picked:
                 path_var.set(os.path.normpath(picked))
 
-        ttk.Button(frm, text="浏览", command=browse).grid(row=4, column=2, padx=(0, 8))
+        ttk.Button(frm, text="浏览", command=browse).grid(row=5, column=2, padx=(0, 8))
 
-        ttk.Label(frm, text="切换路径时会把当前配置复制到新位置；\n改了任一端口或 SOCKS5 认证后需重新点一次“开启共享”；\nSOCKS5 用户名/密码留空 = 无认证。",
-                 foreground="#888", justify="left").grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(frm, text="入口端口被占用（如 Clash）时换一个；改了入口端口需重新点一次“开关代理”；\n切换路径时会把当前配置复制到新位置；\n改了任一端口或 SOCKS5 认证后需重新点一次“开启共享”；\nSOCKS5 用户名/密码留空 = 无认证。",
+                 foreground="#888", justify="left").grid(row=6, column=0, columnspan=3, sticky="w", **pad)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=3, pady=(2, 8))
+        btns.grid(row=7, column=0, columnspan=3, pady=(2, 8))
 
         def on_save():
+            entry_port = self._parse_port(entry_var.get())
+            if entry_port is None:
+                messagebox.showwarning("提示", "入口端口需为 1-65535 的数字", parent=win)
+                return
             port = self._parse_port(port_var.get())
             if port is None:
                 messagebox.showwarning("提示", "共享端口需为 1-65535 的数字", parent=win)
@@ -1821,6 +1932,9 @@ class ProxyApp:
             if socks_port == port:
                 messagebox.showwarning("提示", "SOCKS5 端口不能和共享端口相同", parent=win)
                 return
+            if entry_port == port or entry_port == socks_port:
+                messagebox.showwarning("提示", "入口端口不能和共享/SOCKS5 端口相同", parent=win)
+                return
             new_path = self._normalize_config_path(path_var.get())
             old_path = self.settings["config_path"] or CONFIG_FILE
             changed = os.path.normcase(new_path) != os.path.normcase(old_path)
@@ -1831,6 +1945,7 @@ class ProxyApp:
                             or user_var.get().strip() != self.settings["socks_user"]
                             or pass_var.get() != self.settings["socks_pass"])
             new_settings = {"share_port": port, "socks_port": socks_port,
+                            "entry_port": entry_port,
                             "socks_user": user_var.get().strip(),
                             "socks_pass": pass_var.get(),
                             "config_path": new_path if changed else old_path}
@@ -1841,6 +1956,11 @@ class ProxyApp:
                 return  # 写盘失败就别动内存状态，免得界面和文件分叉
             self.share_port, self.socks_port = port, socks_port
             self.settings = new_settings
+            if entry_port != self.entry_port:
+                self.entry_port = entry_port
+                if self._entry:  # 入口在跑：旧监听还占着旧端口，重开开关才切到新端口
+                    self.up_status_var.set("入口端口已改，重新点一次开关代理生效")
+                    self.up_status_label.config(foreground="#c62828")
             if changed:
                 self.save_preset()  # 立刻把当前配置写到新位置
             if port_changed:

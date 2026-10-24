@@ -173,5 +173,16 @@ class TestToAddrPairs(unittest.TestCase):
         self.assertEqual(pt._to_addr_pairs([]), [])
 
 
+class TestValidateUpstreams(unittest.TestCase):
+    def test_empty(self):
+        self.assertIn("至少", pt.validate_upstreams([]))
+
+    def test_bad_entry(self):
+        self.assertIsNotNone(pt.validate_upstreams([("1.1.1.1", 80), ("bad host", 80)]))
+
+    def test_all_good(self):
+        self.assertIsNone(pt.validate_upstreams([("1.1.1.1", 80)]))
+
+
 if __name__ == "__main__":
     unittest.main()
