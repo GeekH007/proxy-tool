@@ -30,6 +30,7 @@ DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = "7890"
 DEFAULT_SHARE_PORT = 7891
 DEFAULT_SOCKS_PORT = 7892  # SOCKS5 通道端口（局域网共享的第二条通道）
+DEFAULT_ENTRY_PORT = 7890  # 本机入口端口（多代理分流，系统代理指向它）；被 Clash 等占用时设置里可改
 APP_TITLE = "系统代理工具"
 MUTEX_NAME = "MyXm_ProxyTool_SingleInstance"
 TEST_URL = "http://www.gstatic.com/generate_204"
@@ -999,14 +1000,17 @@ def load_settings() -> dict:
     socks_port = data.get("socks_port")
     if not isinstance(socks_port, int) or not 1 <= socks_port <= 65535:
         socks_port = DEFAULT_SOCKS_PORT
+    entry_port = data.get("entry_port")
+    if not isinstance(entry_port, int) or not 1 <= entry_port <= 65535:
+        entry_port = DEFAULT_ENTRY_PORT
     user = data.get("socks_user")
     user = user.strip() if isinstance(user, str) else ""
     password = data.get("socks_pass")
     password = password if isinstance(password, str) else ""
     path = data.get("config_path")
     path = str(path).strip() if isinstance(path, str) else ""
-    return {"share_port": port, "socks_port": socks_port, "socks_user": user,
-            "socks_pass": password, "config_path": path}
+    return {"share_port": port, "socks_port": socks_port, "entry_port": entry_port,
+            "socks_user": user, "socks_pass": password, "config_path": path}
 
 
 def save_settings(settings: dict):
@@ -1019,17 +1023,53 @@ def save_settings(settings: dict):
 
 # ---------- 配置读写（多套预设，兼容旧版单配置格式） ----------
 
+def _valid_host_str(host: str) -> bool:
+    """代理地址格式检查：IPv4 或主机名都合法，拦掉逗号/空格/协议前缀/
+    误填进 IP 栏的“IP:端口”这类手误——乱值写进注册表会断整个系统上网"""
+    if not host or len(host) > 253:
+        return False
+    for lb in host.rstrip(".").split("."):
+        if not lb.isascii() or not lb or len(lb) > 63:
+            return False
+        if not all(c.isalnum() or c == "-" for c in lb):
+            return False
+        if not (lb[0].isalnum() and lb[-1].isalnum()):
+            return False
+    return True
+
+
+def _valid_upstream(ip: str, port: str) -> bool:
+    """上游条目校验：地址合法 + 端口 1-65535（配置文件可能被手改，进池前把好关）"""
+    if not (port.isascii() and port.isdecimal()):
+        return False
+    return _valid_host_str(ip) and 1 <= int(port) <= 65535
+
+
 def _normalize(data) -> dict:
-    """把任意版本的配置统一成 {"current": 名称, "share": bool, "presets": [...]}"""
+    """把任意版本的配置统一成 {"current": 名称, "share": bool,
+    "presets": [{"name": 名, "upstreams": [[ip, 端口], ...]}]}。
+    旧版 {ip, port} 预设/顶层单配置自动迁移成单元素上游组；非法条目整条丢弃。"""
     if not isinstance(data, dict):
         data = {}
-    presets = [{"name": str(p.get("name") or "未命名"),
-                "ip": str(p.get("ip") or DEFAULT_IP),
-                "port": str(p.get("port") or DEFAULT_PORT)}
-               for p in (data.get("presets") or []) if isinstance(p, dict)]
-    if not presets:  # 旧版 {ip, port} 单配置格式，或文件损坏
-        presets = [{"name": "默认", "ip": str(data.get("ip") or DEFAULT_IP),
-                    "port": str(data.get("port") or DEFAULT_PORT)}]
+    presets = []
+    for p in (data.get("presets") or []):
+        if not isinstance(p, dict):
+            continue
+        ups = p.get("upstreams") if isinstance(p.get("upstreams"), list) else None
+        if ups is None:  # 旧版 {ip, port} 单地址预设 → 迁移成单元素组
+            ups = [[p.get("ip") or DEFAULT_IP, p.get("port") or DEFAULT_PORT]]
+        entries = []
+        for u in ups:
+            if isinstance(u, (list, tuple)) and len(u) == 2:
+                ip, port = str(u[0]).strip(), str(u[1]).strip()
+                if _valid_upstream(ip, port):
+                    entries.append([ip, port])
+        if entries:
+            presets.append({"name": str(p.get("name") or "未命名"), "upstreams": entries})
+    if not presets:  # 旧版顶层 {ip, port} 单配置，或文件损坏
+        ip, port = str(data.get("ip") or DEFAULT_IP), str(data.get("port") or DEFAULT_PORT)
+        default = [[ip, port]] if _valid_upstream(ip, port) else [[DEFAULT_IP, DEFAULT_PORT]]
+        presets = [{"name": "默认", "upstreams": default}]
     current = str(data.get("current") or presets[0]["name"])
     if current not in [p["name"] for p in presets]:
         current = presets[0]["name"]
@@ -1420,18 +1460,8 @@ class ProxyApp:
 
     @staticmethod
     def _valid_host(host: str) -> bool:
-        """代理地址格式检查：IPv4 或主机名都合法，拦掉逗号/空格/协议前缀/
-        误填进 IP 栏的“IP:端口”这类手误——乱值写进注册表会断整个系统上网"""
-        if not host or len(host) > 253:
-            return False
-        for lb in host.rstrip(".").split("."):
-            if not lb.isascii() or not lb or len(lb) > 63:
-                return False
-            if not all(c.isalnum() or c == "-" for c in lb):
-                return False
-            if not (lb[0].isalnum() and lb[-1].isalnum()):
-                return False
-        return True
+        """代理地址格式检查（校验逻辑已提取到模块级 _valid_host_str 共用）"""
+        return _valid_host_str(host)
 
     def _valid_inputs(self) -> bool:
         ip = self.ip_var.get().strip()

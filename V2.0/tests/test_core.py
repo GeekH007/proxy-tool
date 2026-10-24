@@ -131,5 +131,38 @@ class TestHttpServer(unittest.TestCase):
         self.assertEqual(conns, 0)                          # 连接已结束
 
 
+class TestConfigMigration(unittest.TestCase):
+    def test_legacy_preset_migrates(self):
+        cfg = pt._normalize({"presets": [{"name": "73", "ip": "192.130.30.73", "port": "7890"}]})
+        self.assertEqual(cfg["presets"][0]["upstreams"], [["192.130.30.73", "7890"]])
+
+    def test_legacy_single_config_migrates(self):
+        cfg = pt._normalize({"ip": "192.130.30.73", "port": "7890"})
+        self.assertEqual(cfg["presets"][0]["upstreams"], [["192.130.30.73", "7890"]])
+
+    def test_new_format_roundtrip(self):
+        src = {"current": "双上游", "share": False,
+               "presets": [{"name": "双上游",
+                            "upstreams": [["192.130.30.73", "7890"], ["192.130.30.91", "7890"]]}]}
+        cfg = pt._normalize(src)
+        self.assertEqual(cfg["presets"][0]["upstreams"], src["presets"][0]["upstreams"])
+        self.assertEqual(cfg["current"], "双上游")
+
+    def test_mixed_presets(self):
+        cfg = pt._normalize({"presets": [
+            {"name": "新", "upstreams": [["1.1.1.1", "80"]]},
+            {"name": "旧", "ip": "2.2.2.2", "port": "8080"}]})
+        self.assertEqual([p["upstreams"] for p in cfg["presets"]],
+                         [[["1.1.1.1", "80"]], [["2.2.2.2", "8080"]]])
+
+    def test_bad_entries_dropped(self):
+        cfg = pt._normalize({"presets": [{"name": "x", "upstreams":
+                         [["1.1.1.1", "80"], ["坏 地址", "80"], ["1.1.1.1", "99999"]]}]})
+        self.assertEqual(cfg["presets"][0]["upstreams"], [["1.1.1.1", "80"]])
+
+    def test_entry_port_constant(self):
+        self.assertEqual(pt.DEFAULT_ENTRY_PORT, 7890)  # 文件读写的回退由 Task 5 手测覆盖
+
+
 if __name__ == "__main__":
     unittest.main()
