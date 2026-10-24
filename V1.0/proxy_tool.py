@@ -391,8 +391,10 @@ class RelayServer:
         self._on = False
         self._lock = threading.Lock()
         self.active_conns = 0  # 当前 TCP 连接总数
-        self.devices = {}      # ip -> {"conns": 当前连接数, "last": 最后活跃时刻}
+        self.devices = {}      # ip -> {"conns": 连接数, "last": 最后活跃, "bd"/"bu": 累计下行/上行字节}
         self._live = set()     # 活跃连接对 (client, up)，stop 时强制断开用
+        self.bytes_down = 0    # 累计下行字节（上游→客户端），锁内更新
+        self.bytes_up = 0      # 累计上行字节（客户端→上游）
 
     def start(self):
         srv = socket.socket()
@@ -440,7 +442,7 @@ class RelayServer:
         except OSError:
             ip = "未知"
         with self._lock:
-            dev = self.devices.setdefault(ip, {"conns": 0, "last": time.monotonic()})
+            dev = self.devices.setdefault(ip, {"conns": 0, "last": time.monotonic(), "bd": 0, "bu": 0})
             dev["conns"] += 1
             self.active_conns += 1
         try:
@@ -464,8 +466,8 @@ class RelayServer:
                 client.close()
                 up.close()
                 return
-            t1 = threading.Thread(target=self._pipe, args=(client, up), daemon=True)
-            t2 = threading.Thread(target=self._pipe, args=(up, client), daemon=True)
+            t1 = threading.Thread(target=self._pipe, args=(client, up, dev, False), daemon=True)
+            t2 = threading.Thread(target=self._pipe, args=(up, client, dev, True), daemon=True)
             t1.start(); t2.start()
             t1.join(); t2.join()
             with self._lock:
@@ -478,25 +480,34 @@ class RelayServer:
                 self.active_conns -= 1
 
     def snapshot(self):
-        """界面轮询用：返回 (当前连接总数, [(ip, 当前连接数, 距最后活跃秒数), ...])"""
+        """界面轮询用：(连接总数, [(ip, 连接数, 距活跃秒, 累计下行, 累计上行), ...],
+        (累计下行字节, 累计上行字节))"""
         now = time.monotonic()
         with self._lock:
             if self.devices:
                 self.devices = {ip: d for ip, d in self.devices.items()
                                 if d["conns"] > 0 or now - d["last"] < DEVICE_TTL_SEC}
-            devs = sorted(((ip, d["conns"], int(now - d["last"]))
+            devs = sorted(((ip, d["conns"], int(now - d["last"]), d["bd"], d["bu"])
                            for ip, d in self.devices.items()),
                           key=lambda x: -x[1])
-            return self.active_conns, devs
+            return self.active_conns, devs, (self.bytes_down, self.bytes_up)
 
-    @staticmethod
-    def _pipe(src, dst):
+    def _pipe(self, src, dst, dev, down: bool):
+        """双向搬运字节；down=True 表示 dst 是客户端（下行）。字节计数拿锁入账"""
         try:
             while True:
                 data = src.recv(65536)
                 if not data:
                     break
                 dst.sendall(data)
+                n = len(data)
+                with self._lock:
+                    if down:
+                        self.bytes_down += n
+                        dev["bd"] += n
+                    else:
+                        self.bytes_up += n
+                        dev["bu"] += n
         except OSError:
             pass
         finally:
@@ -536,6 +547,8 @@ class SocksServer:
         self.active_conns = 0
         self.devices = {}
         self._live = set()
+        self.bytes_down = 0    # 累计下行字节（上游→客户端），锁内更新
+        self.bytes_up = 0      # 累计上行字节（客户端→上游）
 
     def start(self):
         srv = socket.socket()
@@ -577,15 +590,16 @@ class SocksServer:
             threading.Thread(target=self._pump, args=(client,), daemon=True).start()
 
     def snapshot(self):
+        """同 RelayServer.snapshot：(连接总数, 设备列表, (累计下行, 累计上行))"""
         now = time.monotonic()
         with self._lock:
             if self.devices:
                 self.devices = {ip: d for ip, d in self.devices.items()
                                 if d["conns"] > 0 or now - d["last"] < DEVICE_TTL_SEC}
-            devs = sorted(((ip, d["conns"], int(now - d["last"]))
+            devs = sorted(((ip, d["conns"], int(now - d["last"]), d["bd"], d["bu"])
                            for ip, d in self.devices.items()),
                           key=lambda x: -x[1])
-            return self.active_conns, devs
+            return self.active_conns, devs, (self.bytes_down, self.bytes_up)
 
     def _note_error(self, e: _SocksError):
         self.last_error = f"{time.strftime('%H:%M')} {e}"
@@ -685,7 +699,7 @@ class SocksServer:
         except OSError:
             ip = "未知"
         with self._lock:
-            dev = self.devices.setdefault(ip, {"conns": 0, "last": time.monotonic()})
+            dev = self.devices.setdefault(ip, {"conns": 0, "last": time.monotonic(), "bd": 0, "bu": 0})
             dev["conns"] += 1
             self.active_conns += 1
         up = None
@@ -715,8 +729,8 @@ class SocksServer:
                     stopped = not self._on
                 if stopped:
                     return
-                t1 = threading.Thread(target=self._pipe, args=(client, up), daemon=True)
-                t2 = threading.Thread(target=self._pipe, args=(up, client), daemon=True)
+                t1 = threading.Thread(target=self._pipe, args=(client, up, dev, False), daemon=True)
+                t2 = threading.Thread(target=self._pipe, args=(up, client, dev, True), daemon=True)
                 t1.start(); t2.start()
                 t1.join(); t2.join()
                 with self._lock:
@@ -736,14 +750,21 @@ class SocksServer:
                 dev["last"] = time.monotonic()
                 self.active_conns -= 1
 
-    @staticmethod
-    def _pipe(src, dst):  # 同 RelayServer._pipe
+    def _pipe(self, src, dst, dev, down: bool):  # 同 RelayServer._pipe，含字节计数
         try:
             while True:
                 data = src.recv(65536)
                 if not data:
                     break
                 dst.sendall(data)
+                n = len(data)
+                with self._lock:
+                    if down:
+                        self.bytes_down += n
+                        dev["bd"] += n
+                    else:
+                        self.bytes_up += n
+                        dev["bu"] += n
         except OSError:
             pass
         finally:
@@ -754,15 +775,28 @@ class SocksServer:
 
 
 def _merge_devs(a, b):
-    """两路共享的设备表合并：连接数相加，活跃时间取更近的"""
-    m = {ip: [c, sec] for ip, c, sec in a}
-    for ip, c, sec in b:
+    """两路共享的设备表合并：连接数与累计字节相加，活跃时间取更近的"""
+    m = {ip: [c, sec, bd, bu] for ip, c, sec, bd, bu in a}
+    for ip, c, sec, bd, bu in b:
         if ip in m:
-            m[ip][0] += c
-            m[ip][1] = min(m[ip][1], sec)
+            d = m[ip]
+            d[0] += c
+            d[1] = min(d[1], sec)
+            d[2] += bd
+            d[3] += bu
         else:
-            m[ip] = [c, sec]
-    return [(ip, c, s) for ip, (c, s) in m.items()]
+            m[ip] = [c, sec, bd, bu]
+    return [(ip, c, s, bd, bu) for ip, (c, s, bd, bu) in m.items()]
+
+
+def _fmt_speed(n: float) -> str:
+    """字节/秒 → 自动换档的人类可读速率（B/s、KB/s、MB/s、GB/s）"""
+    if n <= 0:
+        return "0 B/s"
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if n < 1024 or unit == "GB/s":
+            return f"{n:.0f} {unit}" if unit == "B/s" else f"{n:.1f} {unit}"
+        n /= 1024
 
 
 # ---------- 应用设置（共享端口、SOCKS5、配置文件路径） ----------
@@ -919,6 +953,8 @@ class ProxyApp:
         self._socks = None          # 运行中的 SocksServer（SOCKS5→HTTP 网关）
         self._share_cfg = cfg["share"]  # 共享开关的持久状态（跨启动恢复用）
         self._lan_hint = _primary_lan_ip() or "本机IP"
+        self._bytes_prev = (0.0, 0, 0)   # 共享速率差分采样 (monotonic, 累计下行, 累计上行)
+        self._dev_bytes_prev = {}        # 客户端列表 per-IP 速率采样 ip -> (t, 下行, 上行)
         pad = {"padx": 12, "pady": 6}
         frm = ttk.Frame(root)
         frm.pack(padx=4, pady=4)
@@ -1125,23 +1161,37 @@ class ProxyApp:
         self.root.after(50, self._pump_ui_queue)
 
     def _share_snapshot(self):
-        """HTTP 转发 + SOCKS5 两路合并的 (连接总数, [(ip, 连接数, 距最后活跃秒)])"""
-        conns, devs = self._relay.snapshot() if self._relay else (0, [])
+        """HTTP 转发 + SOCKS5 两路合并的 (连接总数, 设备列表, (累计下行字节, 累计上行字节))"""
+        conns, devs, total = self._relay.snapshot() if self._relay else (0, [], (0, 0))
         if self._socks:
-            c2, d2 = self._socks.snapshot()
+            c2, d2, t2 = self._socks.snapshot()
             devs = _merge_devs(devs, d2)
             conns += c2
+            total = (total[0] + t2[0], total[1] + t2[1])
         devs.sort(key=lambda x: -x[1])
-        return conns, devs
+        return conns, devs, total
+
+    def _speed_text(self, total) -> str:
+        """按与上次 2 秒采样的差值算速率；首采样或共享重启（计数清零）返回空"""
+        now = time.monotonic()
+        pt, pd, pu = self._bytes_prev
+        self._bytes_prev = (now, total[0], total[1])
+        dt = now - pt
+        if pt == 0.0 or dt <= 0 or total[0] < pd or total[1] < pu:
+            return ""
+        return f"↓ {_fmt_speed(max(0, total[0] - pd) / dt)} ↑ {_fmt_speed(max(0, total[1] - pu) / dt)}"
 
     def _refresh_share_status(self):
-        """共享运行中：状态行显示双通道地址 + 设备/连接计数 + 最近 SOCKS 失败"""
+        """共享运行中：状态行显示双通道地址 + 设备/连接/速率 + 最近 SOCKS 失败"""
         if not self._relay:
             return
-        conns, devs = self._share_snapshot()
-        n_dev = sum(1 for _, _, sec in devs if sec <= ACTIVE_WINDOW_SEC)
+        conns, devs, total = self._share_snapshot()
+        n_dev = sum(1 for d in devs if d[2] <= ACTIVE_WINDOW_SEC)
         up = self._relay.upstream
         tail = f"近10分钟设备 {n_dev} 台，当前连接 {conns} 个" if devs or conns else "暂无设备连接"
+        speed = self._speed_text(total)
+        if speed:
+            tail += f" ｜ {speed}"
         auth = f"账号 {self.settings['socks_user']}" if self.settings["socks_user"] else "无认证"
         text = (f"✓ 共享中\n"
                 f"HTTP: {self._lan_hint}:{self.share_port}\n"
@@ -1581,7 +1631,7 @@ class ProxyApp:
                         self.root.winfo_width(), self.root.winfo_height())
 
     def open_clients(self):
-        """共享客户端列表小窗：每台设备的 IP、当前连接数、最后活跃时间"""
+        """共享客户端列表小窗：每台设备的 IP、当前连接数、实时速率、最后活跃时间"""
         if self._clients_win is not None and self._clients_win.winfo_exists():
             self._clients_win.lift()
             return
@@ -1591,9 +1641,10 @@ class ProxyApp:
         win.title("共享客户端")
         win.resizable(False, False)
         win.transient(self.root)
-        tv = ttk.Treeview(win, columns=("ip", "conns", "last"), show="headings", height=8)
-        for col, text, width in (("ip", "设备 IP", 150), ("conns", "当前连接", 80),
-                                 ("last", "最后活跃", 90)):
+        tv = ttk.Treeview(win, columns=("ip", "conns", "down", "up", "last"), show="headings", height=8)
+        for col, text, width in (("ip", "设备 IP", 130), ("conns", "连接", 50),
+                                 ("down", "↓ 速率", 85), ("up", "↑ 速率", 85),
+                                 ("last", "最后活跃", 80)):
             tv.heading(col, text=text)
             tv.column(col, width=width, anchor="w" if col == "ip" else "center")
         tv.pack(padx=10, pady=(10, 4))
@@ -1605,10 +1656,24 @@ class ProxyApp:
                 return
             tv.delete(*tv.get_children())
             if self._relay or self._socks:
-                conns, devs = self._share_snapshot()
-                for ip, c, sec in devs:
-                    tv.insert("", "end", values=(ip, c, f"{sec} 秒前"))
-                n_dev = sum(1 for _, _, sec in devs if sec <= ACTIVE_WINDOW_SEC)
+                conns, devs, _total = self._share_snapshot()
+                now = time.monotonic()
+                prev = self._dev_bytes_prev
+                seen = set()
+                for ip, c, sec, bd, bu in devs:
+                    seen.add(ip)
+                    old = prev.get(ip)
+                    if old and bd >= old[1] and bu >= old[2] and now > old[0]:
+                        down = (bd - old[1]) / (now - old[0])
+                        ups = (bu - old[2]) / (now - old[0])
+                    else:  # 首次见到，或共享重启后计数清零
+                        down = ups = 0.0
+                    prev[ip] = (now, bd, bu)
+                    tv.insert("", "end", values=(ip, c, _fmt_speed(down), _fmt_speed(ups),
+                                                 f"{sec} 秒前"))
+                for ip in [k for k in prev if k not in seen]:
+                    del prev[ip]
+                n_dev = sum(1 for d in devs if d[2] <= ACTIVE_WINDOW_SEC)
                 summary.config(text=f"当前连接 {conns} 个 ｜ 近10分钟设备 {n_dev} 台")
             else:
                 summary.config(text="共享未开启")
