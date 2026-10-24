@@ -854,6 +854,137 @@ def _fmt_speed(n: float) -> str:
         n /= 1024
 
 
+# ---------- 本机入口（多代理分流） ----------
+
+class HttpServer:
+    """127.0.0.1:listen_port 的本机代理入口：不解协议，按池逐台拨上游，接通后
+    双向搬字节——CONNECT 与明文 GET 都是上游认识的字节流，零解析即全兼容。
+    系统代理指向这里，流量才经过本工具，分流/故障切换才有可能。"""
+
+    def __init__(self, listen_port: int, pool: UpstreamPool):
+        self.listen_port = listen_port
+        self.pool = pool   # 换池对外部生效（set 后新连接用新池），运行中可热切
+        self._srv = None
+        self._on = False
+        self._lock = threading.Lock()
+        self.active_conns = 0   # 当前 TCP 连接总数
+        self.stats = {}         # 上游 -> {"conns","bd","bu"}，锁内更新；换池后旧条目保留供 UI 显示
+        self._live = set()      # 活跃连接对 (client, up)，stop 时强制断开用
+
+    def start(self):
+        srv = socket.socket()
+        try:
+            srv.bind(("127.0.0.1", self.listen_port))  # 只服务本机；绑 0.0.0.0 等于给局域网开免费通道
+            srv.listen(16)
+        except OSError:
+            srv.close()
+            raise
+        self._srv, self._on = srv, True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def stop(self):
+        self._on = False
+        if self._srv:
+            self._srv.close()
+            self._srv = None
+        # 已建立的连接也要掐断（同 RelayServer：keep-alive 长连接不会自己退）
+        with self._lock:
+            pairs = list(self._live)
+        for pair in pairs:
+            for s in pair:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    def _accept_loop(self):
+        srv = self._srv  # 局部快照：stop() 会把 _srv 置 None，别在循环里解引用它
+        while self._on and srv is not None:
+            try:
+                client, _ = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._pump, args=(client,), daemon=True).start()
+
+    def _pump(self, client):
+        with self._lock:
+            self.active_conns += 1
+        try:
+            t_pending = (client,)
+            with self._lock:
+                self._live.add(t_pending)  # 拨上游前就登记，stop() 才掐得到在途连接
+            try:
+                up = None
+                for cand in self.pool.order():
+                    try:
+                        up = socket.create_connection(cand, timeout=5)
+                    except OSError:
+                        self.pool.report_fail(cand)
+                        continue
+                    self.pool.report_ok(cand)
+                    break
+                if up is None:
+                    client.close()  # 池里全连不上，别让客户端 socket 干等
+                    return
+            finally:
+                with self._lock:
+                    self._live.discard(t_pending)
+            up.settimeout(None)  # create_connection 的 timeout 会残留到 recv，掐断 keep-alive
+            pair = (client, up)
+            with self._lock:
+                self._live.add(pair)
+                stopped = not self._on
+                st = self.stats.setdefault(cand, {"conns": 0, "bd": 0, "bu": 0})
+                st["conns"] += 1
+            if stopped:
+                client.close()
+                up.close()
+                return
+            t1 = threading.Thread(target=self._pipe, args=(client, up, st, False), daemon=True)
+            t2 = threading.Thread(target=self._pipe, args=(up, client, st, True), daemon=True)
+            t1.start(); t2.start()
+            t1.join(); t2.join()
+            with self._lock:
+                self._live.discard(pair)
+                st["conns"] -= 1
+            client.close(); up.close()
+        finally:
+            with self._lock:
+                self.active_conns -= 1
+
+    def snapshot(self):
+        """界面轮询用：(连接总数, {上游: (连接数, 累计下行, 累计上行)})"""
+        with self._lock:
+            return self.active_conns, {u: (st["conns"], st["bd"], st["bu"])
+                                       for u, st in self.stats.items()}
+
+    def _pipe(self, src, dst, st, down: bool):
+        """同 RelayServer._pipe，改按上游入账；down=True 表示 dst 是客户端（下行）"""
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+                n = len(data)
+                with self._lock:
+                    if down:
+                        st["bd"] += n
+                    else:
+                        st["bu"] += n
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
 # ---------- 应用设置（共享端口、SOCKS5、配置文件路径） ----------
 
 def load_settings() -> dict:
