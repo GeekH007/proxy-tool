@@ -1045,6 +1045,17 @@ def _valid_upstream(ip: str, port: str) -> bool:
     return _valid_host_str(ip) and 1 <= int(port) <= 65535
 
 
+def _to_addr_pairs(upstreams: list) -> list:
+    """配置里的 [[ip, 端口], ...]（字符串对）→ [(ip, int(端口)), ...]，非法条目滤掉"""
+    out = []
+    for u in upstreams:
+        if isinstance(u, (list, tuple)) and len(u) == 2:
+            ip, port = str(u[0]).strip(), str(u[1]).strip()
+            if _valid_upstream(ip, port):
+                out.append((ip, int(port)))
+    return out
+
+
 def _normalize(data) -> dict:
     """把任意版本的配置统一成 {"current": 名称, "share": bool,
     "presets": [{"name": 名, "upstreams": [[ip, 端口], ...]}]}。
@@ -1181,6 +1192,9 @@ class ProxyApp:
         self._lan_hint = _primary_lan_ip() or "本机IP"
         self._bytes_prev = (0.0, 0, 0)   # 共享速率差分采样 (monotonic, 累计下行, 累计上行)
         self._dev_bytes_prev = {}        # 客户端列表 per-IP 速率采样 ip -> (t, 下行, 上行)
+        self.entry_port = self.settings["entry_port"]
+        self._pool = UpstreamPool(self._pool_addrs())  # 当前预设的上游组
+        self._entry = None               # 运行中的 HttpServer（本机入口，多代理分流）
         pad = {"padx": 12, "pady": 6}
         frm = ttk.Frame(root)
         frm.pack(padx=4, pady=4)
@@ -1201,12 +1215,13 @@ class ProxyApp:
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
         ttk.Label(frm, text="代理地址").grid(row=1, column=0, sticky="e", **pad)
-        self.ip_var = tk.StringVar(value=self._current_preset()["ip"])
+        _up0 = self._current_preset()["upstreams"][0]  # 输入框先显示池[0]，Task 5 改造为「添加上游」用途
+        self.ip_var = tk.StringVar(value=_up0[0])
         self.ip_entry = ttk.Entry(frm, textvariable=self.ip_var, width=22)
         self.ip_entry.grid(row=1, column=1, sticky="w", **pad)
 
         ttk.Label(frm, text="代理端口").grid(row=2, column=0, sticky="e", **pad)
-        self.port_var = tk.StringVar(value=self._current_preset()["port"])
+        self.port_var = tk.StringVar(value=_up0[1])
         self.port_entry = ttk.Entry(frm, textvariable=self.port_var, width=22)
         self.port_entry.grid(row=2, column=1, sticky="w", **pad)
         # 回车=应用并开启，只绑输入框：绑 root 会把删除按钮/下拉框上的回车也误触成开代理
@@ -1277,8 +1292,9 @@ class ProxyApp:
         if self._adding:  # 新增模式里改选预设 = 放弃新增，恢复按钮
             self._exit_add_mode(restore=False)
         p = self._current_preset()
-        self.ip_var.set(p["ip"])
-        self.port_var.set(p["port"])
+        up0 = p["upstreams"][0]
+        self.ip_var.set(up0[0])
+        self.port_var.set(up0[1])
         self._sync_relay_upstream()
 
     def delete_preset(self):
@@ -1293,24 +1309,26 @@ class ProxyApp:
         self.presets = rest
         first = self.presets[0]
         self.preset_var.set(first["name"])
-        self.ip_var.set(first["ip"])
-        self.port_var.set(first["port"])
+        up0 = first["upstreams"][0]
+        self.ip_var.set(up0[0])
+        self.port_var.set(up0[1])
         self._sync_preset_box()
         self._sync_relay_upstream()  # 共享运行中也要跟上切换后的地址
         self.save_preset()
 
     def save_preset(self) -> bool:
-        """把当前填写的地址端口存进当前名字的预设（名字是新的则新建）。返回是否落盘成功"""
-        ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
+        """把当前上游组存进当前名字的预设（名字是新的则新建）。返回是否落盘成功"""
+        ups = [[ip, str(port)] for ip, port in self._pool_addrs()]
         name = self.preset_var.get().strip()
         if not name:
-            name = f"{ip}:{port}" if ip or port else "默认"
+            first = ups[0] if ups else ["", ""]
+            name = f"{first[0]}:{first[1]}" if first[0] else "默认"
         for p in self.presets:
             if p["name"] == name:
-                p["ip"], p["port"] = ip, port
+                p["upstreams"] = ups
                 break
         else:
-            self.presets.append({"name": name, "ip": ip, "port": port})
+            self.presets.append({"name": name, "upstreams": ups})
             self._sync_preset_box()
         self.preset_var.set(name)
         try:
@@ -1430,6 +1448,8 @@ class ProxyApp:
     def refresh_status(self):
         self.enabled, server = get_system_proxy()
         if self.enabled:
+            if server.startswith("127.0.0.1:"):  # 指向本机入口 = 多代理模式
+                server = f"本机入口 {server}（{len(self._pool_addrs())} 台上游）"
             self.status_var.set(f"● 已开启  {server}")
             self.status_label.config(foreground="#1a7f37")
             self.btn.config(text="关闭代理", style="On.TButton")
@@ -1472,39 +1492,66 @@ class ProxyApp:
                                parent=self.root)
         return False
 
-    def _read_upstream(self):
-        ip = self.ip_var.get().strip()
-        port = self._parse_port(self.port_var.get())
-        if ip and port and self._valid_host(ip):
-            return (ip, port)
-        return None
+    def _pool_addrs(self) -> list:
+        """当前预设的上游组 → [(ip, int(端口)), ...]"""
+        return _to_addr_pairs(self._current_preset()["upstreams"])
 
-    def _sync_relay_upstream(self):
-        """转发目标始终跟随当前填写的代理，新连接即生效，无需重启共享"""
+    def _read_upstream(self):
+        """共享通道跟随的上游 = 池[0]（与 V1 行为等价：单一确定目标）"""
+        addrs = self._pool_addrs()
+        return addrs[0] if addrs else None
+
+    def _sync_pools(self):
+        """入口池与共享上游始终跟随当前预设：入口热切对新连接生效，无需重启"""
+        if self._entry:
+            self._entry.pool.set(self._pool_addrs())
         up = self._read_upstream()
         if up and self._relay:
             self._relay.upstream = up
         if up and self._socks:
             self._socks.upstream = up
 
+    def _sync_relay_upstream(self):
+        """转发目标跟随逻辑已并入 _sync_pools；保留旧名给既有调用点"""
+        self._sync_pools()
+
     def toggle(self):
         self.apply(not self.enabled)
 
     def apply(self, enable: bool):
-        ip = self.ip_var.get().strip()
-        port = self.port_var.get().strip()
-        if enable and not self._valid_inputs():
-            return
-        try:
-            if enable:
-                set_system_proxy(f"{ip}:{port}")
-            else:
+        if enable:
+            addrs = self._pool_addrs()
+            if not addrs:
+                messagebox.showwarning("提示", "上游池为空，请先在预设里配置上游",
+                                       parent=self.root)
+                return
+            self._pool.set(addrs)
+            if self._entry is None:  # 入口只在缺时起；改入口端口后重开一次开关生效
+                try:
+                    self._entry = HttpServer(self.entry_port, self._pool)
+                    self._entry.start()
+                except OSError as e:
+                    self._entry = None
+                    messagebox.showerror(
+                        "错误", f"入口端口 {self.entry_port} 起不来（被其他程序占用？），"
+                                f"可在设置的共享页改入口端口：\n{e}", parent=self.root)
+                    return
+            try:
+                set_system_proxy(f"127.0.0.1:{self.entry_port}")
+            except OSError as e:
+                messagebox.showerror("错误", f"操作失败：\n{e}", parent=self.root)
+                return
+            self.save_preset()  # 记住这次用的上游组
+        else:
+            try:
                 disable_system_proxy()
-        except OSError as e:
-            messagebox.showerror("错误", f"操作失败：\n{e}", parent=self.root)
-            return
-        self.save_preset()  # 记住这次填的地址端口
-        self._sync_relay_upstream()
+            except OSError as e:
+                messagebox.showerror("错误", f"操作失败：\n{e}", parent=self.root)
+                return
+            if self._entry:  # 先摘注册表再停监听，断流窗口最小
+                self._entry.stop()
+                self._entry = None
+        self._sync_pools()
         self.refresh_status()
 
     def toggle_autostart(self):

@@ -164,5 +164,14 @@ class TestConfigMigration(unittest.TestCase):
         self.assertEqual(pt.DEFAULT_ENTRY_PORT, 7890)  # 文件读写的回退由 Task 5 手测覆盖
 
 
+class TestToAddrPairs(unittest.TestCase):
+    def test_convert(self):
+        self.assertEqual(pt._to_addr_pairs([["1.1.1.1", "80"], ["h.com", "8080"]]),
+                         [("1.1.1.1", 80), ("h.com", 8080)])
+
+    def test_empty(self):
+        self.assertEqual(pt._to_addr_pairs([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
