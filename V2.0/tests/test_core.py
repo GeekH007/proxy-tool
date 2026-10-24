@@ -1,5 +1,6 @@
 import os, sys, unittest
-import socket, threading, time
+import json, socket, tempfile, threading, time
+from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import proxy_tool as pt
 
@@ -182,6 +183,51 @@ class TestValidateUpstreams(unittest.TestCase):
 
     def test_all_good(self):
         self.assertIsNone(pt.validate_upstreams([("1.1.1.1", 80)]))
+
+
+class TestV1Coexistence(unittest.TestCase):
+    """V2 必须独立存配置：V1 读不懂 upstreams 格式，共享文件会被 V1 退出时覆写成默认值"""
+
+    def test_config_dir_is_v2_specific(self):
+        self.assertTrue(pt.CONFIG_DIR.rstrip("\\/").endswith("ProxyToolV2"))
+
+    def test_first_boot_migrates_from_v1_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.path.join(tmp, "ProxyTool", "proxy_config.json")
+            os.makedirs(os.path.dirname(old))
+            with open(old, "w", encoding="utf-8") as f:
+                json.dump({"current": "73",
+                           "presets": [{"name": "73", "ip": "192.130.30.73", "port": "7890"}]}, f)
+            new_file = os.path.join(tmp, "ProxyToolV2", "proxy_config.json")
+            with mock.patch.object(pt, "CONFIG_FILE", new_file), \
+                 mock.patch.object(pt, "OLD_CONFIG_FILE", old), \
+                 mock.patch.object(pt, "LEGACY_CONFIG_FILE", os.path.join(tmp, "无.json")):
+                cfg = pt.load_config()
+            self.assertEqual(cfg["presets"][0]["upstreams"], [["192.130.30.73", "7890"]])
+            self.assertTrue(os.path.exists(new_file))  # 读到旧格式 → 迁到 V2 位置并升级
+
+    def test_settings_fallback_to_v1_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.path.join(tmp, "ProxyTool", "settings.json")
+            os.makedirs(os.path.dirname(old))
+            with open(old, "w", encoding="utf-8") as f:
+                json.dump({"share_port": 8000, "socks_port": 8002, "socks_user": "u"}, f)
+            new_file = os.path.join(tmp, "ProxyToolV2", "settings.json")
+            with mock.patch.object(pt, "SETTINGS_FILE", new_file), \
+                 mock.patch.object(pt, "OLD_SETTINGS_FILE", old):
+                st = pt.load_settings()
+            self.assertEqual(st["share_port"], 8000)   # 旧共享端口带上
+            self.assertEqual(st["entry_port"], 7890)   # 旧文件没有的新键走默认
+
+
+class TestParseEntryAddr(unittest.TestCase):
+    def test_loopback_with_port(self):
+        self.assertEqual(pt._parse_entry_addr("127.0.0.1:7890"), 7890)
+
+    def test_external_and_garbage(self):
+        self.assertIsNone(pt._parse_entry_addr("192.130.30.73:7890"))
+        self.assertIsNone(pt._parse_entry_addr("127.0.0.1:xx"))
+        self.assertIsNone(pt._parse_entry_addr(""))
 
 
 if __name__ == "__main__":

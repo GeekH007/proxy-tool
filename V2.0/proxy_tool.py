@@ -22,10 +22,15 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 INTERNET_OPTION_SETTINGS_CHANGED = 39
 INTERNET_OPTION_REFRESH = 37
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or _BASE_DIR, "ProxyTool")
+# V2 独立目录：V1 读不懂 upstreams 格式，若共用 ProxyTool 目录，V1 一退出就会把
+# 全部预设覆写成默认值——两个版本各守各的配置，互不见面
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or _BASE_DIR, "ProxyToolV2")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "proxy_config.json")  # 默认配置位置（可在设置里改）
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")    # 应用设置（固定放这，不跟随配置路径）
-LEGACY_CONFIG_FILE = os.path.join(_BASE_DIR, "proxy_config.json")  # 旧版配置位置，读到即迁移
+_OLD_DIR = os.path.join(os.environ.get("APPDATA") or _BASE_DIR, "ProxyTool")
+OLD_CONFIG_FILE = os.path.join(_OLD_DIR, "proxy_config.json")    # V1 配置，V2 首启读一次迁走
+OLD_SETTINGS_FILE = os.path.join(_OLD_DIR, "settings.json")      # V1 设置，带上旧共享端口/认证
+LEGACY_CONFIG_FILE = os.path.join(_BASE_DIR, "proxy_config.json")  # 更早期配置位置，读到即迁移
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = "7890"
 DEFAULT_SHARE_PORT = 7891
@@ -988,11 +993,21 @@ class HttpServer:
 
 # ---------- 应用设置（共享端口、SOCKS5、配置文件路径） ----------
 
-def load_settings() -> dict:
+def _read_json(path: str):
+    """读 JSON 文件；打不开/坏了返回 None（调用方自己给默认）"""
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except (OSError, ValueError):
+        return None
+
+
+def load_settings() -> dict:
+    data = _read_json(SETTINGS_FILE)
+    if data is None and not os.path.exists(SETTINGS_FILE):
+        # V2 settings 还没写过 → 首启带上 V1 的共享端口/SOCKS 认证（entry_port 等新键走默认）
+        data = _read_json(OLD_SETTINGS_FILE)
+    if not isinstance(data, dict):
         data = {}
     port = data.get("share_port")
     if not isinstance(port, int) or not 1 <= port <= 65535:
@@ -1066,6 +1081,16 @@ def validate_upstreams(pairs: list):
     return None
 
 
+def _parse_entry_addr(server: str):
+    """注册表代理值 → 本机入口端口；非 127.0.0.1:端口 形态返回 None"""
+    if not server.startswith("127.0.0.1:"):
+        return None
+    try:
+        return int(server.split(":", 1)[1])
+    except ValueError:
+        return None
+
+
 def _normalize(data) -> dict:
     """把任意版本的配置统一成 {"current": 名称, "share": bool,
     "presets": [{"name": 名, "upstreams": [[ip, 端口], ...]}]}。
@@ -1098,8 +1123,8 @@ def _normalize(data) -> dict:
 
 
 def _config_candidates(custom: str) -> list:
-    """读取配置的候选位置，按优先级：自定义路径 > %APPDATA% 默认 > 项目目录旧位置"""
-    paths = ([custom] if custom else []) + [CONFIG_FILE, LEGACY_CONFIG_FILE]
+    """读取配置的候选位置，按优先级：自定义路径 > V2 默认 > V1 目录（首启迁移源）> 项目目录旧位置"""
+    paths = ([custom] if custom else []) + [CONFIG_FILE, OLD_CONFIG_FILE, LEGACY_CONFIG_FILE]
     seen, out = set(), []
     for p in paths:
         key = os.path.normcase(os.path.normpath(p))
@@ -1277,6 +1302,7 @@ class ProxyApp:
         self.test_result_label.grid(row=7, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
         self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
         self._refresh_pool_box()
+        self._restore_entry()
 
         ttk.Separator(frm).grid(row=8, column=0, columnspan=2,
                                 sticky="ew", padx=12, pady=(2, 2))  # 主功能/辅助设置分区
@@ -1328,6 +1354,24 @@ class ProxyApp:
         self._refresh_pool_box()
         self._sync_relay_upstream()
 
+    def _restore_entry(self):
+        """开机自启后注册表还指着本机入口：把入口拉起来；池坏或端口被占就摘注册表，
+        绝不挂着"已开启"的名头让全机流量指向没人听的端口"""
+        enabled, server = get_system_proxy()
+        if not enabled or _parse_entry_addr(server) != self.entry_port:
+            return
+        addrs = self._pool_addrs()
+        if validate_upstreams(addrs):
+            disable_system_proxy()  # 池空/坏：入口没法有意义地跑，先恢复直连
+            return
+        try:
+            self._pool.set(addrs)
+            self._entry = HttpServer(self.entry_port, self._pool)
+            self._entry.start()
+        except OSError:
+            self._entry = None
+            disable_system_proxy()
+
     # ---- 上游池 ----
 
     def _refresh_pool_box(self):
@@ -1366,6 +1410,8 @@ class ProxyApp:
         del cur["upstreams"][int(sel[0])]
         self._test_gen += 1
         self.test_result_var.set("")
+        # 在途的逐台测试被作废时按钮可能永远停在"测试中…"——gen 变化的源头顺手恢复它
+        self.test_btn.config(state="normal", text="测试连通")
         self._refresh_pool_box()
         self._sync_pools()
         self.save_preset()
@@ -1429,8 +1475,8 @@ class ProxyApp:
         self.preset_var.set("")  # 名字也清空（留空保存时自动用 ip:端口 当名字）
         self.ip_var.set("")
         self.port_var.set("")    # 置空即触发 trace：红框复位、旧测试结果作废
-        for w in (self.btn, self.share_btn):
-            w.config(state="disabled")  # 半成品地址不能应用/共享
+        for w in (self.btn, self.share_btn, self.add_up_btn):
+            w.config(state="disabled")  # 半成品地址不能应用/共享，也不能加进别家预设的池
         # 「删除」临时变「取消」：不新增按钮，布局零变化（删除在新增模式里本来就不可用）
         self.delete_preset_btn.config(text="取消", command=self._cancel_add_mode)
         self.save_preset_btn.config(text="存预设")
@@ -1440,7 +1486,7 @@ class ProxyApp:
         self._adding = False
         self.save_preset_btn.config(text="新增")
         self.delete_preset_btn.config(text="删除", command=self.delete_preset)
-        for w in (self.btn, self.share_btn):
+        for w in (self.btn, self.share_btn, self.add_up_btn):
             w.config(state="normal")
         if restore:  # 取消/退出：还原进来之前的样子，别把半成品留下
             name, ip, port = self._add_backup
@@ -1541,6 +1587,8 @@ class ProxyApp:
         if not self._entry:
             self.up_status_var.set("")
             return
+        if self._entry.listen_port != self.entry_port:
+            return  # 「端口已改待重开」的红字提示别被 2 秒轮询顶掉
         _, stats = self._entry.snapshot()
         now = time.monotonic()
         parts = []
@@ -1574,6 +1622,8 @@ class ProxyApp:
         self.port_entry.config(style="TEntry" if port_ok else "Invalid.TEntry")
         self._test_gen += 1
         self.test_result_var.set("")
+        # 在途的逐台测试被作废时按钮可能永远停在"测试中…"——gen 变化的源头顺手恢复它
+        self.test_btn.config(state="normal", text="测试连通")
 
     @staticmethod
     def _valid_host(host: str) -> bool:
