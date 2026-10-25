@@ -1280,46 +1280,64 @@ class ProxyApp:
                                             command=self.delete_preset)
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
-        ttk.Label(frm, text="上游地址").grid(row=1, column=0, sticky="e", **pad)
-        self.ip_var = tk.StringVar()   # 输入框是「添加上游」的入口，平时留空
-        self.ip_entry = ttk.Entry(frm, textvariable=self.ip_var, width=22)
-        self.ip_entry.grid(row=1, column=1, sticky="w", **pad)
-
-        ttk.Label(frm, text="上游端口").grid(row=2, column=0, sticky="e", **pad)
-        port_frm = ttk.Frame(frm)
-        port_frm.grid(row=2, column=1, sticky="w", **pad)
+        # ---- 单/多两种形态占同一 grid 单元，切预设即切形态 ----
+        # 单形态（V1 式）：地址端口两格直接编辑当前预设的那台上游（Task 4 接保存）
+        single_frm = ttk.Frame(frm)
+        single_frm.grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(single_frm, text="上游地址").grid(row=0, column=0, sticky="e", **pad)
+        self.ip_var = tk.StringVar()
+        self.ip_entry = ttk.Entry(single_frm, textvariable=self.ip_var, width=22)
+        self.ip_entry.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(single_frm, text="上游端口").grid(row=1, column=0, sticky="e", **pad)
+        port_frm = ttk.Frame(single_frm)
+        port_frm.grid(row=1, column=1, sticky="w", **pad)
         self.port_var = tk.StringVar()
         self.port_entry = ttk.Entry(port_frm, textvariable=self.port_var, width=15)
         self.port_entry.pack(side="left")
-        self.add_up_btn = ttk.Button(port_frm, text="添加", width=6, padding=(5, 0),
-                                     command=self.add_upstream)
-        self.add_up_btn.pack(side="left", padx=(4, 0))
-        # 回车=添加上游：只绑输入框，防误触大开关；新增模式里回车仍=存预设
+        # 回车：新增模式=存预设；平时单形态的编辑保存由 Task 4 接入
         for ent in (self.ip_entry, self.port_entry):
-            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding else self.add_upstream())
+            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding else None)
         self.ip_var.trace_add("write", self._on_addr_changed)    # 编辑即校验+作废旧测试结果
         self.port_var.trace_add("write", self._on_addr_changed)
 
-        # 上游池一览：选中可移除（至少保留一台）；入口运行中每台分流各走各的
-        pool_frm = ttk.Frame(frm)
-        pool_frm.grid(row=3, column=1, sticky="w", **pad)
-        self.pool_box = ttk.Treeview(pool_frm, columns=("up",), show="headings", height=3,
-                                      selectmode="browse")
-        self.pool_box.heading("up", text="上游池（按连接分流）")
-        self.pool_box.column("up", width=170, anchor="w")
+        # 多形态：单行 IP:端口 回车即入池；池表兼作状态表（速率/连接/测试分列）
+        multi_frm = ttk.Frame(frm)
+        multi_frm.grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(multi_frm, text="添加上游").grid(row=0, column=0, sticky="e", **pad)
+        add_frm = ttk.Frame(multi_frm)
+        add_frm.grid(row=0, column=1, sticky="w", **pad)
+        self.add_var = tk.StringVar()
+        self.add_entry = ttk.Entry(add_frm, textvariable=self.add_var, width=22)
+        self.add_entry.pack(side="left")
+        self.add_entry.bind("<Return>", lambda _e: self.add_upstream())
+        self.add_up_btn = ttk.Button(add_frm, text="添加", width=6, padding=(5, 0),
+                                     command=self.add_upstream)
+        self.add_up_btn.pack(side="left", padx=(4, 0))
+        pool_frm = ttk.Frame(multi_frm)
+        pool_frm.grid(row=1, column=1, sticky="w", **pad)
+        self.pool_box = ttk.Treeview(pool_frm,
+                                      columns=("addr", "down", "up", "conns", "test"),
+                                      show="headings", height=4, selectmode="browse")
+        for col, text, w, anchor in (("addr", "上游", 185, "w"), ("down", "↓", 62, "e"),
+                                     ("up", "↑", 62, "e"), ("conns", "连接", 40, "e"),
+                                     ("test", "测试", 70, "w")):
+            self.pool_box.heading(col, text=text)
+            self.pool_box.column(col, width=w, anchor=anchor, stretch=False)
         self.pool_box.pack(side="left")
         ttk.Button(pool_frm, text="移除", width=6, padding=(5, 0),
                    command=self.remove_upstream).pack(side="left", padx=(6, 0), anchor="n")
+        self.single_frm, self.multi_frm = single_frm, multi_frm
 
         self.status_var = tk.StringVar()
         self.status_label = ttk.Label(frm, textvariable=self.status_var, foreground="#555")
         self.status_label.grid(row=4, column=0, columnspan=2, **pad)
 
-        # 入口运行中：每台上游的 连接数/速率 分列（2 秒差分，与共享状态行同款）
-        self.up_status_var = tk.StringVar()
-        self.up_status_label = ttk.Label(frm, textvariable=self.up_status_var, foreground="#555",
-                                         justify="left", anchor="w", wraplength=300)
-        self.up_status_label.grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 2))
+        # 单形态速率行（入口运行中 2 秒差分，永不换行）；多形态的每台速率在池表列里
+        self.entry_speed_var = tk.StringVar()
+        self.entry_speed_label = ttk.Label(frm, textvariable=self.entry_speed_var,
+                                           foreground="#555")
+        self.entry_speed_label.grid(row=5, column=0, columnspan=2, sticky="w",
+                                    padx=12, pady=(0, 2))
         self._up_bytes_prev = {}   # 上游 -> (t, 下行, 上行) 差分采样
 
         self.btn = ttk.Button(frm, width=18, command=self.toggle)
@@ -1332,6 +1350,7 @@ class ProxyApp:
                                           wraplength=300)  # 长错误文本折行，别撑宽定宽窗口
         self.test_result_label.grid(row=7, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
         self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
+        self._apply_form()       # 形态跟随当前预设（内部 set 再触发一次 trace，无害）
         self._refresh_pool_box()
         self._restore_entry()
 
@@ -1380,10 +1399,29 @@ class ProxyApp:
     def on_preset_selected(self, _event=None):
         if self._adding:  # 新增模式里改选预设 = 放弃新增，恢复按钮
             self._exit_add_mode(restore=False)
-        self.ip_var.set("")   # 输入框是添加用途，切预设清空防误加
-        self.port_var.set("")
+        self._apply_form()
         self._refresh_pool_box()
         self._sync_relay_upstream()
+
+    def _apply_form(self):
+        """界面形态跟随当前预设类型：单=两格直接编辑，多=单行添加+池表。
+        切形态时窗口高度变化是预期行为（布局变化），流量刷新不再撑动窗口。"""
+        single = self._current_preset()["type"] == "single"
+        if single:
+            self.single_frm.grid()
+            self.multi_frm.grid_remove()
+            self.entry_speed_label.grid()
+            ip, port = (self._pool_addrs() or [("", "")])[0]
+            self.ip_var.set(ip)          # set 会触发 trace：红框复位、旧测试结果作废
+            self.port_var.set(str(port))
+        else:
+            self.single_frm.grid_remove()
+            self.multi_frm.grid()
+            self.entry_speed_label.grid_remove()
+            self.entry_speed_var.set("")
+            self.ip_var.set("")          # 多形态两格隐藏，清空防编辑语义混用
+            self.port_var.set("")
+        self.add_var.set("")
 
     def _restore_entry(self):
         """开机自启后注册表还指着本机入口：把入口拉起来；池坏或端口被占就摘注册表，
@@ -1406,23 +1444,24 @@ class ProxyApp:
     # ---- 上游池 ----
 
     def _refresh_pool_box(self):
-        """池列表跟随当前预设重画；iid 用索引，移除时好对位"""
+        """池表跟随当前预设重画；iid 用索引，移除时好对位"""
         self.pool_box.delete(*self.pool_box.get_children())
         for i, (ip, port) in enumerate(self._pool_addrs()):
-            self.pool_box.insert("", "end", iid=str(i), values=(f"{ip}:{port}",))
+            self.pool_box.insert("", "end", iid=str(i),
+                                 values=(f"{ip}:{port}", "", "", "", ""))
 
     def add_upstream(self):
-        """把输入框的地址端口加进当前预设的池（重复的不加），入口热切新连接生效"""
-        ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
-        if not _valid_upstream(ip, port):
-            messagebox.showwarning("提示", "请填写正确的上游地址（IP 或主机名）和端口（1-65535）",
+        """把单行输入框的 IP:端口 加进当前预设的池（重复的不加），入口热切新连接生效"""
+        parsed = parse_upstream_line(self.add_var.get())
+        if not parsed:
+            messagebox.showwarning("提示", "格式：IP:端口（如 192.130.30.73:7890）",
                                    parent=self.root)
             return
+        ip, port = parsed
         cur = self._current_preset()
         if [ip, port] not in cur["upstreams"]:
             cur["upstreams"].append([ip, port])
-        self.ip_var.set("")
-        self.port_var.set("")
+        self.add_var.set("")
         self._test_gen += 1          # 池变了，旧测试结果作废
         self.test_result_var.set("")
         self._refresh_pool_box()
@@ -1604,8 +1643,10 @@ class ProxyApp:
     def refresh_status(self):
         self.enabled, server = get_system_proxy()
         if self.enabled:
-            if server.startswith("127.0.0.1:"):  # 指向本机入口 = 多代理模式
-                server = f"本机入口 {server}（{len(self._pool_addrs())} 台上游）"
+            if server.startswith("127.0.0.1:"):  # 指向本机入口
+                n = len(self._pool_addrs())
+                server = (f"本机入口 {server}" if self._current_preset()["type"] == "single"
+                          else f"本机入口 {server}（{n} 台上游）")
             self.status_var.set(f"● 已开启  {server}")
             self.status_label.config(foreground="#1a7f37")
             self.btn.config(text="关闭代理", style="On.TButton")
@@ -1616,25 +1657,39 @@ class ProxyApp:
         self._entry_status_text()
 
     def _entry_status_text(self):
-        """入口分列状态：每台上游 连接数 + 2 秒差分速率；入口没跑就清空该行"""
+        """入口速率/连接分形态展示：多形态写池表各列（按列 set，不覆测试列），
+        单形态写一行速率；入口没跑就清空"""
         if not self._entry:
-            self.up_status_var.set("")
+            self.entry_speed_var.set("")
             return
         if self._entry.listen_port != self.entry_port:
             return  # 「端口已改待重开」的红字提示别被 2 秒轮询顶掉
         _, stats = self._entry.snapshot()
         now = time.monotonic()
-        parts = []
+        single = self._current_preset()["type"] == "single"
+        addrs = self._pool_addrs()
+        iid_of = {up: str(i) for i, up in enumerate(addrs)}
+        first = addrs[0] if addrs else None
         for up, (c, bd, bu) in stats.items():
             prev = self._up_bytes_prev.get(up)
             self._up_bytes_prev[up] = (now, bd, bu)
+            d_text = u_text = ""
             if prev and bd >= prev[1] and bu >= prev[2] and now > prev[0]:
                 dt = now - prev[0]
-                parts.append(f"{up[0]}:{up[1]} ↓{_fmt_speed((bd - prev[1]) / dt)} "
-                             f"↑{_fmt_speed((bu - prev[2]) / dt)} {c}连")
-            else:  # 首次见到或入口重启计数清零：先给基点，下轮出速率
-                parts.append(f"{up[0]}:{up[1]} {c}连")
-        self.up_status_var.set("  ｜  ".join(parts))
+                d_text = _fmt_speed((bd - prev[1]) / dt)
+                u_text = _fmt_speed((bu - prev[2]) / dt)
+            if single:
+                if up == first:  # 单形态只关心那一台
+                    parts = [t for t in (f"↓ {d_text}" if d_text else "",
+                                         f"↑ {u_text}" if u_text else "",
+                                         f"{c}连" if c else "") if t]
+                    self.entry_speed_var.set("  ".join(parts))
+            else:
+                iid = iid_of.get(up)
+                if iid and self.pool_box.exists(iid):
+                    self.pool_box.set(iid, "down", d_text)
+                    self.pool_box.set(iid, "up", u_text)
+                    self.pool_box.set(iid, "conns", str(c) if c else "")
 
     @staticmethod
     def _parse_port(text: str):
@@ -2042,8 +2097,8 @@ class ProxyApp:
             if entry_port != self.entry_port:
                 self.entry_port = entry_port
                 if self._entry:  # 入口在跑：旧监听还占着旧端口，重开开关才切到新端口
-                    self.up_status_var.set("入口端口已改，重新点一次开关代理生效")
-                    self.up_status_label.config(foreground="#c62828")
+                    self.test_result_var.set("入口端口已改，重新点一次开关代理生效")
+                    self.test_result_label.config(foreground="#c62828")
             if changed:
                 self.save_preset()  # 立刻把当前配置写到新位置
             if port_changed:
