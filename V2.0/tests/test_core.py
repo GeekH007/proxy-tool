@@ -488,5 +488,37 @@ class TestDraftPreset(_AppTest):
         self.assertEqual(self.app._draft["upstreams"], [])
 
 
+class TestReviewFixes(_AppTest):
+    """终审修复回归：C1 draft 旁路落盘、I1 删除预设切形态、I2 测试中添加恢复按钮"""
+
+    def test_bypass_save_preset_during_draft_keeps_disk(self):
+        before = self._read_disk()
+        self.app._enter_add_mode("multi", "新池")   # 空草稿，preset_var 已置空
+        ok = self.app.save_preset()                 # 模拟设置页保存/在途共享完成等旁路
+        self.assertTrue(ok)                         # 拒绝落盘不算失败，别弹错
+        self.assertEqual(self._read_disk(), before)        # 磁盘分毫未动
+        self.assertEqual([p["name"] for p in self.app.presets], ["s", "m"])
+
+    def test_save_preset_normal_path_unaffected(self):
+        self.app._current_preset()["upstreams"].append(["3.3.3.3", "80"])
+        self.assertTrue(self.app.save_preset())
+        saved = [p for p in self._read_disk()["presets"] if p["name"] == "m"][0]
+        self.assertEqual(len(saved["upstreams"]), 3)
+
+    def test_delete_preset_switches_form(self):
+        self.app.delete_preset()                    # 删当前 m → 剩 s（single）
+        self.assertEqual(self.app.preset_var.get(), "s")
+        self.assertEqual(self.app.single_frm.winfo_manager(), "grid")
+        self.assertEqual(self.app.multi_frm.winfo_manager(), "")
+        self.assertEqual(self.app.ip_var.get(), "1.1.1.1")   # 两格带出新预设的上游
+
+    def test_add_during_pending_test_restores_button(self):
+        self.app.test_btn.config(state="disabled", text="测试中…")   # 模拟测试在途
+        self.app.add_var.set("3.3.3.3:80")
+        self.app.add_upstream()
+        self.assertEqual(str(self.app.test_btn.cget("state")), "normal")
+        self.assertEqual(self.app.test_btn["text"], "测试连通")
+
+
 if __name__ == "__main__":
     unittest.main()

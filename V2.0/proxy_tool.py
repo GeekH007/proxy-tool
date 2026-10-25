@@ -1457,6 +1457,13 @@ class ProxyApp:
             self.pool_box.insert("", "end", iid=str(i),
                                  values=(f"{ip}:{port}", "", "", "", ""))
 
+    def _invalidate_test_results(self):
+        """作废在途与既有测试结果（池/地址变了）：gen 变更的源头必须恢复按钮，
+        否则一旦结果被丢弃收不回来，「测试连通」永远停在测试中"""
+        self._test_gen += 1
+        self.test_result_var.set("")
+        self.test_btn.config(state="normal", text="测试连通")
+
     def _commit_single_edit(self):
         """单形态地址/端口直接编辑的落盘：回车或失焦触发；非法（红框在）或值未变不落盘"""
         cur = self._current_preset()
@@ -1468,8 +1475,7 @@ class ProxyApp:
         if cur["upstreams"] and cur["upstreams"][0] == [ip, port]:
             return  # 值没变（每次点击都会来一发 FocusOut），别折腾
         cur["upstreams"] = [[ip, port]]
-        self._test_gen += 1          # 上游变了，旧测试结果作废
-        self.test_result_var.set("")
+        self._invalidate_test_results()  # 上游变了，旧测试结果作废
         self._sync_pools()           # 入口/共享热切，新连接走新地址
         self.save_preset()
 
@@ -1486,8 +1492,7 @@ class ProxyApp:
         if [ip, port] not in cur["upstreams"]:
             cur["upstreams"].append([ip, port])
         self.add_var.set("")
-        self._test_gen += 1          # 池变了，旧测试结果作废
-        self.test_result_var.set("")
+        self._invalidate_test_results()  # 池变了，旧测试结果作废
         self._refresh_pool_box()
         if not self._adding:
             self._sync_pools()
@@ -1504,10 +1509,7 @@ class ProxyApp:
             messagebox.showinfo("提示", "至少要保留一台上游", parent=self.root)
             return
         del cur["upstreams"][int(sel[0])]
-        self._test_gen += 1
-        self.test_result_var.set("")
-        # 在途的逐台测试被作废时按钮可能永远停在"测试中…"——gen 变化的源头顺手恢复它
-        self.test_btn.config(state="normal", text="测试连通")
+        self._invalidate_test_results()
         self._refresh_pool_box()
         if not self._adding:
             self._sync_pools()
@@ -1525,8 +1527,7 @@ class ProxyApp:
         self.presets = rest
         first = self.presets[0]
         self.preset_var.set(first["name"])
-        self.ip_var.set("")
-        self.port_var.set("")
+        self._apply_form()       # 形态/两格跟随新当前预设（此前只清两格，删完形态不切）
         self._sync_preset_box()
         self._refresh_pool_box()
         self._sync_relay_upstream()  # 共享运行中也要跟上切换后的地址
@@ -1534,6 +1535,8 @@ class ProxyApp:
 
     def save_preset(self, ups=None) -> bool:
         """把上游组存进当前名字的预设（名字是新的则新建）；ups 缺省=当前池。返回是否落盘成功"""
+        if self._draft is not None and not any(p is self._draft for p in self.presets):
+            return True   # 草稿隔离中：设置页保存/在途共享完成等旁路此刻不是落盘时机
         if ups is None:
             ups = [[ip, str(port)] for ip, port in self._pool_addrs()]
         name = self.preset_var.get().strip()
@@ -1630,8 +1633,7 @@ class ProxyApp:
         self._add_backup = self.preset_var.get()
         self._draft = {"name": name, "type": ptype, "upstreams": []}
         self.preset_var.set("")    # 不指向任何现有预设（_current_preset 会转投草稿）
-        self._test_gen += 1
-        self.test_result_var.set("")
+        self._invalidate_test_results()
         # 半成品不能开代理/共享；「添加」不禁——draft 的池就靠它和回车
         for w in (self.btn, self.share_btn):
             w.config(state="disabled")
@@ -1799,10 +1801,7 @@ class ProxyApp:
         port_ok = not port or self._parse_port(port) is not None
         self.ip_entry.config(style="TEntry" if ip_ok else "Invalid.TEntry")
         self.port_entry.config(style="TEntry" if port_ok else "Invalid.TEntry")
-        self._test_gen += 1
-        self.test_result_var.set("")
-        # 在途的逐台测试被作废时按钮可能永远停在"测试中…"——gen 变化的源头顺手恢复它
-        self.test_btn.config(state="normal", text="测试连通")
+        self._invalidate_test_results()
 
     @staticmethod
     def _valid_host(host: str) -> bool:
