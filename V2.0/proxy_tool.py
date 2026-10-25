@@ -1328,9 +1328,9 @@ class ProxyApp:
         self.pool_box = ttk.Treeview(pool_frm,
                                       columns=("addr", "down", "up", "conns", "test"),
                                       show="headings", height=4, selectmode="browse")
-        for col, text, w, anchor in (("addr", "上游", 185, "w"), ("down", "↓", 62, "e"),
-                                     ("up", "↑", 62, "e"), ("conns", "连接", 40, "e"),
-                                     ("test", "测试", 70, "w")):
+        for col, text, w, anchor in (("addr", "上游", 200, "w"), ("down", "↓", 82, "e"),
+                                     ("up", "↑", 82, "e"), ("conns", "连接", 46, "e"),
+                                     ("test", "测试", 80, "w")):
             self.pool_box.heading(col, text=text)
             self.pool_box.column(col, width=w, anchor=anchor, stretch=False)
         self.pool_box.pack(side="left")
