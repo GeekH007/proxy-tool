@@ -547,6 +547,10 @@ class TestLayoutAlignment(_AppTest):
         self.app._apply_form()
         self.assertIn("", calls)   # geometry("")=交还 tk 按内容重算宽高
 
+    def test_window_title_shows_version(self):
+        # 标题栏带版本号：一眼区分跑的是哪个版本
+        self.assertIn("V2.0", self.app.root.title())
+
     def test_add_during_pending_test_restores_button(self):
         self.app.test_btn.config(state="disabled", text="测试中…")   # 模拟测试在途
         self.app.add_var.set("3.3.3.3:80")
