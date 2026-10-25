@@ -508,9 +508,44 @@ class TestReviewFixes(_AppTest):
     def test_delete_preset_switches_form(self):
         self.app.delete_preset()                    # 删当前 m → 剩 s（single）
         self.assertEqual(self.app.preset_var.get(), "s")
-        self.assertEqual(self.app.single_frm.winfo_manager(), "grid")
-        self.assertEqual(self.app.multi_frm.winfo_manager(), "")
+        self.assertEqual(self.app.port_frm.winfo_manager(), "grid")   # 单形态组在
+        self.assertEqual(self.app.add_frm.winfo_manager(), "")        # 多形态组撤
         self.assertEqual(self.app.ip_var.get(), "1.1.1.1")   # 两格带出新预设的上游
+
+
+class TestLayoutAlignment(_AppTest):
+    """布局对齐回归：单/多形态控件直挂主网格与「预设」同列（不再是各自的独立网格），
+    切形态即整组显隐——「预设」下拉与「添加上游」输入框起点天然对齐"""
+
+    def test_forms_share_main_grid(self):
+        app = self.app
+        # 单/多形态的内容控件与 preset_frm 同父（同一主网格）
+        self.assertEqual(app.ip_entry.winfo_parent(), app.preset_frm.winfo_parent())
+        self.assertEqual(app.add_frm.winfo_parent(), app.preset_frm.winfo_parent())
+        # 显示中的形态组与 preset_frm 同列（col1，起点对齐）；grid_info 只对显示中控件有效
+        self.assertEqual(app.add_frm.grid_info()["column"], app.preset_frm.grid_info()["column"])
+        app.presets[app.presets.index(app._current_preset())]["type"] = "single"
+        app._apply_form()
+        self.assertEqual(app.ip_entry.grid_info()["column"], app.preset_frm.grid_info()["column"])
+
+    def test_switch_hides_inactive_form_group(self):
+        app = self.app  # CURRENT=m：多形态在显示
+        self.assertEqual(app.ip_entry.winfo_manager(), "")   # 单形态两格整组隐藏
+        self.assertEqual(app.port_frm.winfo_manager(), "")
+        self.assertEqual(app.add_frm.winfo_manager(), "grid")  # 多形态在
+        app.presets[app.presets.index(app._current_preset())]["type"] = "single"
+        app._apply_form()                                     # 切回单形态
+        self.assertEqual(app.add_frm.winfo_manager(), "")     # 多形态组隐藏
+        self.assertEqual(app.pool_frm.winfo_manager(), "")
+        self.assertEqual(app.ip_entry.winfo_manager(), "grid")  # 单形态组在
+
+    def test_apply_form_recalculates_window_size(self):
+        # resizable(False,False) 会把窗口锁在上次布局的尺寸：切形态后不重算，
+        # 多形态池表/预设行按钮就被截在窗外（用户实测截断的根源）
+        calls = []
+        self.app.root.geometry = calls.append
+        self.app._apply_form()
+        self.assertIn("", calls)   # geometry("")=交还 tk 按内容重算宽高
 
     def test_add_during_pending_test_restores_button(self):
         self.app.test_btn.config(state="disabled", text="测试中…")   # 模拟测试在途

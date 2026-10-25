@@ -1265,12 +1265,13 @@ class ProxyApp:
         self._entry = None               # 运行中的 HttpServer（本机入口，多代理分流）
         pad = {"padx": 12, "pady": 6}
         frm = ttk.Frame(root)
-        frm.pack(padx=4, pady=4)
+        frm.pack(padx=6, pady=6)
 
         ttk.Label(frm, text="预设").grid(row=0, column=0, sticky="e", **pad)
-        preset_frm = ttk.Frame(frm)
-        preset_frm.grid(row=0, column=1, sticky="w", **pad)
-        self.preset_box = ttk.Combobox(preset_frm, textvariable=self.preset_var, width=16,
+        self.preset_frm = ttk.Frame(frm)
+        self.preset_frm.grid(row=0, column=1, sticky="w", **pad)
+        preset_frm = self.preset_frm
+        self.preset_box = ttk.Combobox(preset_frm, textvariable=self.preset_var, width=25,
                                        values=[p["name"] for p in self.presets])
         self.preset_box.pack(side="left")
         self.preset_box.bind("<<ComboboxSelected>>", self.on_preset_selected)
@@ -1282,17 +1283,19 @@ class ProxyApp:
                                             command=self.delete_preset)
         self.delete_preset_btn.pack(side="left", padx=(4, 0))
 
-        # ---- 单/多两种形态占同一 grid 单元，切预设即切形态 ----
+        # ---- 单/多两种形态直挂主网格，共用 row1/row2 与标签列（col0）——
+        # 「预设」下拉与「添加上游」输入框起点天然对齐；切形态即整组显隐 ----
         # 单形态（V1 式）：地址端口两格直接编辑当前预设的那台上游（Task 4 接保存）
-        single_frm = ttk.Frame(frm)
-        single_frm.grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Label(single_frm, text="上游地址").grid(row=0, column=0, sticky="e", **pad)
+        self.addr_lbl = ttk.Label(frm, text="上游地址")
+        self.addr_lbl.grid(row=1, column=0, sticky="e", **pad)
         self.ip_var = tk.StringVar()
-        self.ip_entry = ttk.Entry(single_frm, textvariable=self.ip_var, width=22)
-        self.ip_entry.grid(row=0, column=1, sticky="w", **pad)
-        ttk.Label(single_frm, text="上游端口").grid(row=1, column=0, sticky="e", **pad)
-        port_frm = ttk.Frame(single_frm)
-        port_frm.grid(row=1, column=1, sticky="w", **pad)
+        self.ip_entry = ttk.Entry(frm, textvariable=self.ip_var, width=26)
+        self.ip_entry.grid(row=1, column=1, sticky="w", **pad)
+        self.port_lbl = ttk.Label(frm, text="上游端口")
+        self.port_lbl.grid(row=2, column=0, sticky="e", **pad)
+        self.port_frm = ttk.Frame(frm)
+        self.port_frm.grid(row=2, column=1, sticky="w", **pad)
+        port_frm = self.port_frm
         self.port_var = tk.StringVar()
         self.port_entry = ttk.Entry(port_frm, textvariable=self.port_var, width=15)
         self.port_entry.pack(side="left")
@@ -1306,20 +1309,21 @@ class ProxyApp:
         self.port_var.trace_add("write", self._on_addr_changed)
 
         # 多形态：单行 IP:端口 回车即入池；池表兼作状态表（速率/连接/测试分列）
-        multi_frm = ttk.Frame(frm)
-        multi_frm.grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Label(multi_frm, text="添加上游").grid(row=0, column=0, sticky="e", **pad)
-        add_frm = ttk.Frame(multi_frm)
-        add_frm.grid(row=0, column=1, sticky="w", **pad)
+        self.add_lbl = ttk.Label(frm, text="添加上游")
+        self.add_lbl.grid(row=1, column=0, sticky="e", **pad)
+        self.add_frm = ttk.Frame(frm)
+        self.add_frm.grid(row=1, column=1, sticky="w", **pad)
+        add_frm = self.add_frm
         self.add_var = tk.StringVar()
-        self.add_entry = ttk.Entry(add_frm, textvariable=self.add_var, width=22)
+        self.add_entry = ttk.Entry(add_frm, textvariable=self.add_var, width=26)
         self.add_entry.pack(side="left")
         self.add_entry.bind("<Return>", lambda _e: self.add_upstream())
         self.add_up_btn = ttk.Button(add_frm, text="添加", width=6, padding=(5, 0),
                                      command=self.add_upstream)
         self.add_up_btn.pack(side="left", padx=(4, 0))
-        pool_frm = ttk.Frame(multi_frm)
-        pool_frm.grid(row=1, column=1, sticky="w", **pad)
+        self.pool_frm = ttk.Frame(frm)
+        self.pool_frm.grid(row=2, column=1, sticky="w", **pad)
+        pool_frm = self.pool_frm
         self.pool_box = ttk.Treeview(pool_frm,
                                       columns=("addr", "down", "up", "conns", "test"),
                                       show="headings", height=4, selectmode="browse")
@@ -1331,7 +1335,9 @@ class ProxyApp:
         self.pool_box.pack(side="left")
         ttk.Button(pool_frm, text="移除", width=6, padding=(5, 0),
                    command=self.remove_upstream).pack(side="left", padx=(6, 0), anchor="n")
-        self.single_frm, self.multi_frm = single_frm, multi_frm
+        # 切形态显隐的两组控件（_apply_form 按当前预设类型整组 grid/grid_remove）
+        self._single_widgets = (self.addr_lbl, self.ip_entry, self.port_lbl, self.port_frm)
+        self._multi_widgets = (self.add_lbl, self.add_frm, self.pool_frm)
 
         self.status_var = tk.StringVar()
         self.status_label = ttk.Label(frm, textvariable=self.status_var, foreground="#555")
@@ -1341,19 +1347,21 @@ class ProxyApp:
         self.entry_speed_var = tk.StringVar()
         self.entry_speed_label = ttk.Label(frm, textvariable=self.entry_speed_var,
                                            foreground="#555")
-        self.entry_speed_label.grid(row=5, column=0, columnspan=2, sticky="w",
-                                    padx=12, pady=(0, 2))
+        self.entry_speed_label.grid(row=5, column=1, sticky="w", pady=(0, 2))
         self._up_bytes_prev = {}   # 上游 -> (t, 下行, 上行) 差分采样
 
         self.btn = ttk.Button(frm, width=18, command=self.toggle)
         self.btn.grid(row=6, column=0, columnspan=2, ipady=4, padx=12, pady=(2, 4))
 
-        self.test_btn = ttk.Button(frm, text="测试连通", width=8, command=self.test_connectivity)
-        self.test_btn.grid(row=7, column=0, sticky="w", padx=(12, 4), pady=(0, 6))
+        # 测试行收进 col1（与输入框同列），按钮不再把标签列撑宽
+        test_frm = ttk.Frame(frm)
+        test_frm.grid(row=7, column=1, sticky="w", padx=(12, 0), pady=(0, 6))
+        self.test_btn = ttk.Button(test_frm, text="测试连通", width=8, command=self.test_connectivity)
+        self.test_btn.pack(side="left")
         self.test_result_var = tk.StringVar()
-        self.test_result_label = ttk.Label(frm, textvariable=self.test_result_var, foreground="#555",
+        self.test_result_label = ttk.Label(test_frm, textvariable=self.test_result_var, foreground="#555",
                                           wraplength=300)  # 长错误文本折行，别撑宽定宽窗口
-        self.test_result_label.grid(row=7, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
+        self.test_result_label.pack(side="left", padx=(8, 0))
         self._on_addr_changed()  # 初次按载入的配置刷红框（配置 JSON 可能被手改坏）
         self._apply_form()       # 形态跟随当前预设（内部 set 再触发一次 trace，无害）
         self._refresh_pool_box()
@@ -1377,7 +1385,7 @@ class ProxyApp:
         self.share_status_var = tk.StringVar()
         self.share_status_label = ttk.Label(frm, textvariable=self.share_status_var, foreground="#555",
                                            justify="left", anchor="w",
-                                           wraplength=300)  # 共享中的双通道长文案折行，别撑宽窗口
+                                           wraplength=420)  # 共享中的双通道长文案折行，别撑宽窗口
         self.share_status_label.grid(row=11, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
         self._set_share_status(self._share_off_text())
 
@@ -1412,23 +1420,27 @@ class ProxyApp:
 
     def _apply_form(self):
         """界面形态跟随当前预设类型：单=两格直接编辑，多=单行添加+池表。
+        两组控件共用主网格行列，切形态即整组显隐（标签列统一、起点对齐）；
         切形态时窗口高度变化是预期行为（布局变化），流量刷新不再撑动窗口。"""
         single = self._current_preset()["type"] == "single"
+        for w in self._single_widgets:
+            (w.grid if single else w.grid_remove)()
+        for w in self._multi_widgets:
+            (w.grid_remove if single else w.grid)()
         if single:
-            self.single_frm.grid()
-            self.multi_frm.grid_remove()
             self.entry_speed_label.grid()
             ip, port = (self._pool_addrs() or [("", "")])[0]
             self.ip_var.set(ip)          # set 会触发 trace：红框复位、旧测试结果作废
             self.port_var.set(str(port))
         else:
-            self.single_frm.grid_remove()
-            self.multi_frm.grid()
             self.entry_speed_label.grid_remove()
             self.entry_speed_var.set("")
             self.ip_var.set("")          # 多形态两格隐藏，清空防编辑语义混用
             self.port_var.set("")
         self.add_var.set("")
+        # resizable(False,False) 把窗口锁在上次布局的尺寸——不重算的话，
+        # 单形态下开的窗口切到多形态，池表和预设行按钮会截在窗外
+        self.root.geometry("")           # 交还 tk 按当前内容重算宽高
 
     def _restore_entry(self):
         """开机自启后注册表还指着本机入口：把入口拉起来；池坏或端口被占就摘注册表，
