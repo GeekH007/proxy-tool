@@ -1294,9 +1294,12 @@ class ProxyApp:
         self.port_var = tk.StringVar()
         self.port_entry = ttk.Entry(port_frm, textvariable=self.port_var, width=15)
         self.port_entry.pack(side="left")
-        # 回车：新增模式=存预设；平时单形态的编辑保存由 Task 4 接入
+        # 回车=应用编辑（新增模式=存预设）；失焦也提交（单形态直接编辑语义）
         for ent in (self.ip_entry, self.port_entry):
-            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding else None)
+            ent.bind("<Return>", lambda _e: self.on_add_or_save() if self._adding
+                     else self._commit_single_edit())
+            ent.bind("<FocusOut>", lambda _e: None if self._adding
+                     else self._commit_single_edit())
         self.ip_var.trace_add("write", self._on_addr_changed)    # 编辑即校验+作废旧测试结果
         self.port_var.trace_add("write", self._on_addr_changed)
 
@@ -1449,6 +1452,22 @@ class ProxyApp:
         for i, (ip, port) in enumerate(self._pool_addrs()):
             self.pool_box.insert("", "end", iid=str(i),
                                  values=(f"{ip}:{port}", "", "", "", ""))
+
+    def _commit_single_edit(self):
+        """单形态地址/端口直接编辑的落盘：回车或失焦触发；非法（红框在）或值未变不落盘"""
+        cur = self._current_preset()
+        if cur["type"] != "single":
+            return  # 多形态下两格隐藏（如切换瞬间的 FocusOut），别把残留值写进池
+        ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
+        if not _valid_upstream(ip, port):
+            return  # 红框已在提示，静默不落盘
+        if cur["upstreams"] and cur["upstreams"][0] == [ip, port]:
+            return  # 值没变（每次点击都会来一发 FocusOut），别折腾
+        cur["upstreams"] = [[ip, port]]
+        self._test_gen += 1          # 上游变了，旧测试结果作废
+        self.test_result_var.set("")
+        self._sync_pools()           # 入口/共享热切，新连接走新地址
+        self.save_preset()
 
     def add_upstream(self):
         """把单行输入框的 IP:端口 加进当前预设的池（重复的不加），入口热切新连接生效"""

@@ -1,5 +1,5 @@
 import os, sys, unittest
-import json, socket, tempfile, threading, time
+import json, shutil, socket, tempfile, threading, time
 from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import proxy_tool as pt
@@ -303,6 +303,76 @@ class TestShortConnError(unittest.TestCase):
 
     def test_unknown_falls_back(self):
         self.assertEqual(pt._short_conn_error(ValueError("x")), "失败")
+
+
+@unittest.skipUnless(hasattr(pt, "tk"), "tkinter 不可用时跳过")
+class TestSingleFormEdit(unittest.TestCase):
+    """单形态直接编辑的落盘判定（真 Tk，不进 mainloop；托盘/轮询/入口恢复全隔离）"""
+
+    def setUp(self):
+        import tkinter as tk
+        self.root = tk.Tk()
+        self.root.withdraw()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.cfg_path = os.path.join(tmp, "c.json")
+        cfg = {"current": "s", "share": False, "presets": [
+            {"name": "s", "type": "single", "upstreams": [["1.1.1.1", "80"]]},
+            {"name": "m", "type": "multi",
+             "upstreams": [["1.1.1.1", "80"], ["2.2.2.2", "80"]]}]}
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        patchers = [
+            mock.patch.object(pt, "CONFIG_FILE", self.cfg_path),
+            mock.patch.object(pt, "SETTINGS_FILE", os.path.join(tmp, "s.json")),
+            mock.patch.object(pt, "OLD_SETTINGS_FILE", os.path.join(tmp, "no_s.json")),
+            mock.patch.object(pt, "OLD_CONFIG_FILE", os.path.join(tmp, "no_c.json")),
+            mock.patch.object(pt, "LEGACY_CONFIG_FILE", os.path.join(tmp, "no_l.json")),
+            mock.patch.object(pt, "TrayIcon",
+                              mock.MagicMock(side_effect=Exception("no tray"))),
+            mock.patch.object(pt.ProxyApp, "_restore_entry"),
+            mock.patch.object(pt.ProxyApp, "_auto_refresh"),
+            mock.patch.object(pt.ProxyApp, "_pump_ui_queue"),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        self.app = pt.ProxyApp(self.root)
+        self.addCleanup(self.root.destroy)
+
+    def _read_disk(self):
+        with open(self.cfg_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_commit_updates_preset_and_saves(self):
+        self.app.ip_var.set("9.9.9.9")
+        self.app.port_var.set("1080")
+        self.app._commit_single_edit()
+        self.assertEqual(self.app.presets[0]["upstreams"], [["9.9.9.9", "1080"]])
+        self.assertEqual(self._read_disk()["presets"][0]["upstreams"], [["9.9.9.9", "1080"]])
+
+    def test_commit_invalid_keeps_old(self):
+        before = self._read_disk()
+        self.app.ip_var.set("bad host!")
+        self.app._commit_single_edit()
+        self.assertEqual(self.app.presets[0]["upstreams"], [["1.1.1.1", "80"]])
+        self.assertEqual(self._read_disk(), before)   # 非法值不落盘
+
+    def test_commit_unchanged_skips_save(self):
+        with mock.patch.object(self.app, "save_preset") as save:
+            self.app.ip_var.set("1.1.1.1")
+            self.app.port_var.set("80")
+            self.app._commit_single_edit()
+            save.assert_not_called()                  # 值没变别折腾
+
+    def test_commit_on_multi_preset_noop(self):
+        self.app.preset_var.set("m")
+        self.app._apply_form()
+        self.app.ip_var.set("9.9.9.9")
+        self.app.port_var.set("1080")
+        self.app._commit_single_edit()
+        self.assertEqual(self.app.presets[1]["upstreams"],
+                         [["1.1.1.1", "80"], ["2.2.2.2", "80"]])  # 池没被污染
 
 
 if __name__ == "__main__":
