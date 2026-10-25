@@ -1093,8 +1093,10 @@ def _parse_entry_addr(server: str):
 
 def _normalize(data) -> dict:
     """把任意版本的配置统一成 {"current": 名称, "share": bool,
-    "presets": [{"name": 名, "upstreams": [[ip, 端口], ...]}]}。
-    旧版 {ip, port} 预设/顶层单配置自动迁移成单元素上游组；非法条目整条丢弃。"""
+    "presets": [{"name": 名, "type": "single"|"multi", "upstreams": [[ip, 端口], ...]}]}。
+    旧版 {ip, port} 预设/顶层单配置自动迁移成单元素上游组；非法条目整条丢弃。
+    type 缺失/非法按台数推断（1→single，≥2→multi）；type=single 却有 ≥2 台时
+    改判 multi——绝不截断丢数据。"""
     if not isinstance(data, dict):
         data = {}
     presets = []
@@ -1111,11 +1113,17 @@ def _normalize(data) -> dict:
                 if _valid_upstream(ip, port):
                     entries.append([ip, port])
         if entries:
-            presets.append({"name": str(p.get("name") or "未命名"), "upstreams": entries})
+            ptype = p.get("type")
+            if ptype not in ("single", "multi"):
+                ptype = "single" if len(entries) == 1 else "multi"
+            elif ptype == "single" and len(entries) >= 2:
+                ptype = "multi"
+            presets.append({"name": str(p.get("name") or "未命名"),
+                            "type": ptype, "upstreams": entries})
     if not presets:  # 旧版顶层 {ip, port} 单配置，或文件损坏
         ip, port = str(data.get("ip") or DEFAULT_IP), str(data.get("port") or DEFAULT_PORT)
         default = [[ip, port]] if _valid_upstream(ip, port) else [[DEFAULT_IP, DEFAULT_PORT]]
-        presets = [{"name": "默认", "upstreams": default}]
+        presets = [{"name": "默认", "type": "single", "upstreams": default}]
     current = str(data.get("current") or presets[0]["name"])
     if current not in [p["name"] for p in presets]:
         current = presets[0]["name"]
@@ -1448,7 +1456,9 @@ class ProxyApp:
                 p["upstreams"] = ups
                 break
         else:
-            self.presets.append({"name": name, "upstreams": ups})
+            self.presets.append({"name": name,
+                                 "type": "single" if len(ups) == 1 else "multi",
+                                 "upstreams": ups})
             self._sync_preset_box()
         self.preset_var.set(name)
         try:

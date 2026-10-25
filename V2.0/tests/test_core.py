@@ -230,5 +230,46 @@ class TestParseEntryAddr(unittest.TestCase):
         self.assertIsNone(pt._parse_entry_addr(""))
 
 
+class TestPresetTypeMigration(unittest.TestCase):
+    def test_no_type_inferred_by_count(self):
+        cfg = pt._normalize({"presets": [
+            {"name": "a", "upstreams": [["1.1.1.1", "80"]]},
+            {"name": "b", "upstreams": [["1.1.1.1", "80"], ["2.2.2.2", "80"]]}]})
+        self.assertEqual([p["type"] for p in cfg["presets"]], ["single", "multi"])
+
+    def test_single_with_two_upstreams_reclassified(self):
+        cfg = pt._normalize({"presets": [{"name": "x", "type": "single",
+            "upstreams": [["1.1.1.1", "80"], ["2.2.2.2", "80"]]}]})
+        self.assertEqual(cfg["presets"][0]["type"], "multi")
+        self.assertEqual(len(cfg["presets"][0]["upstreams"]), 2)  # 不截断
+
+    def test_invalid_type_value_inferred(self):
+        cfg = pt._normalize({"presets": [{"name": "x", "type": "singel",
+            "upstreams": [["1.1.1.1", "80"]]}]})
+        self.assertEqual(cfg["presets"][0]["type"], "single")
+
+    def test_multi_with_one_stays_multi(self):
+        cfg = pt._normalize({"presets": [{"name": "x", "type": "multi",
+            "upstreams": [["1.1.1.1", "80"]]}]})
+        self.assertEqual(cfg["presets"][0]["type"], "multi")
+
+    def test_v1_single_address_preset_migrates(self):
+        cfg = pt._normalize({"presets": [{"name": "旧", "ip": "1.1.1.1", "port": "80"}]})
+        self.assertEqual(cfg["presets"][0], {"name": "旧", "type": "single",
+                                             "upstreams": [["1.1.1.1", "80"]]})
+
+    def test_fallback_default_carries_type(self):
+        cfg = pt._normalize(None)
+        self.assertEqual(cfg["presets"][0]["type"], "single")
+
+    def test_save_config_roundtrips_type(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            pt.save_config("x", [{"name": "x", "type": "multi",
+                                  "upstreams": [["1.1.1.1", "80"]]}], False, path)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["presets"][0]["type"], "multi")
+
+
 if __name__ == "__main__":
     unittest.main()
