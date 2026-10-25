@@ -1248,6 +1248,7 @@ class ProxyApp:
         self._test_gen = 0        # 测试轮次：地址变更后旧结果（含在途）作废
         self._test_results = {}   # "ip:port" -> (ok, ms|原因对象)，收齐 total 条才恢复按钮
         self._adding = False      # 「新增」模式：填新预设期间，开关/共享/删除暂禁用
+        self._draft = None        # 新增模式的草稿预设 {"name","type","upstreams"}；存才落盘
         self._ui_queue = queue.Queue()  # 工作线程→主线程的 UI 任务队列
         self._pump_ui_queue()
         cfg = load_config(self.settings["config_path"])
@@ -1395,6 +1396,8 @@ class ProxyApp:
     # ---- 预设 ----
 
     def _current_preset(self) -> dict:
+        if self._draft is not None:  # 新增模式：池/表跟随草稿，落盘前与 presets 隔离
+            return self._draft
         for p in self.presets:
             if p["name"] == self.preset_var.get():
                 return p
@@ -1471,7 +1474,8 @@ class ProxyApp:
         self.save_preset()
 
     def add_upstream(self):
-        """把单行输入框的 IP:端口 加进当前预设的池（重复的不加），入口热切新连接生效"""
+        """把单行输入框的 IP:端口 加进当前预设的池（重复的不加）；
+        新增模式只进草稿，点「存预设」才落盘；常态则入口热切新连接生效"""
         parsed = parse_upstream_line(self.add_var.get())
         if not parsed:
             messagebox.showwarning("提示", "格式：IP:端口（如 192.130.30.73:7890）",
@@ -1485,16 +1489,18 @@ class ProxyApp:
         self._test_gen += 1          # 池变了，旧测试结果作废
         self.test_result_var.set("")
         self._refresh_pool_box()
-        self._sync_pools()
-        self.save_preset()
+        if not self._adding:
+            self._sync_pools()
+            self.save_preset()
 
     def remove_upstream(self):
-        """移除池中选中的一台；最后一家不许删（删空就没法分流了）"""
+        """移除池中选中的一台；常态最后一家不许删（删空就没法分流了），
+        新增模式的草稿里可以删到 0（存的时候拦「至少一台上游」）"""
         sel = self.pool_box.selection()
         if not sel:
             return
         cur = self._current_preset()
-        if len(cur["upstreams"]) <= 1:
+        if not self._adding and len(cur["upstreams"]) <= 1:
             messagebox.showinfo("提示", "至少要保留一台上游", parent=self.root)
             return
         del cur["upstreams"][int(sel[0])]
@@ -1503,8 +1509,9 @@ class ProxyApp:
         # 在途的逐台测试被作废时按钮可能永远停在"测试中…"——gen 变化的源头顺手恢复它
         self.test_btn.config(state="normal", text="测试连通")
         self._refresh_pool_box()
-        self._sync_pools()
-        self.save_preset()
+        if not self._adding:
+            self._sync_pools()
+            self.save_preset()
 
     def delete_preset(self):
         if len(self.presets) <= 1:
@@ -1551,41 +1558,105 @@ class ProxyApp:
         return True
 
     def on_add_or_save(self):
-        """按钮双态：常态「新增」进入新增模式；新增模式「存预设」校验+落盘并退出"""
+        """按钮双态：常态「新增」弹窗选类型进新增模式；新增模式「存预设」校验+落盘并退出"""
         if self._adding:
-            if self._valid_inputs():
+            draft = self._draft
+            if draft["type"] == "single":
                 ip, port = self.ip_var.get().strip(), self.port_var.get().strip()
-                if self.save_preset([[ip, port]]):  # 新预设从输入框这一台起步
-                    self._refresh_pool_box()
-                    self._exit_add_mode(restore=False)
+                if not _valid_upstream(ip, port):
+                    messagebox.showwarning(
+                        "提示", "请填写正确的代理地址（IP 或主机名）和端口（1-65535）",
+                        parent=self.root)
+                    return
+                draft["upstreams"] = [[ip, port]]
+            elif not draft["upstreams"]:
+                messagebox.showwarning("提示", "至少添加一台上游", parent=self.root)
+                return
+            self.presets.append(draft)
+            self._sync_preset_box()
+            self.preset_var.set(draft["name"])
+            if not self.save_preset():   # 落盘失败回滚内存，半成品不留
+                self.presets.remove(draft)
+                self._sync_preset_box()
+                return
+            self._exit_add_mode(restore=False)
+            self._apply_form()
+            self._refresh_pool_box()
         else:
-            self._enter_add_mode()
+            self._open_new_preset_dialog()
 
-    def _enter_add_mode(self):
+    def _open_new_preset_dialog(self):
+        """新增预设第一站：选类型+名称；确定后才进入主界面的填写模式"""
+        win = tk.Toplevel(self.root)
+        win.title("新增预设")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        type_var = tk.StringVar(value="single")
+        name_var = tk.StringVar()
+        ttk.Label(win, text="类型").grid(row=0, column=0, sticky="e", padx=12, pady=8)
+        type_frm = ttk.Frame(win)
+        type_frm.grid(row=0, column=1, sticky="w", padx=12, pady=8)
+        ttk.Radiobutton(type_frm, text="单代理（一个地址）",
+                        variable=type_var, value="single").pack(side="left")
+        ttk.Radiobutton(type_frm, text="多代理（上游池，按连接分流）",
+                        variable=type_var, value="multi").pack(side="left", padx=(8, 0))
+        ttk.Label(win, text="名称").grid(row=1, column=0, sticky="e", padx=12, pady=8)
+        name_entry = ttk.Entry(win, textvariable=name_var, width=20)
+        name_entry.grid(row=1, column=1, sticky="w", padx=12, pady=8)
+
+        def confirm():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning("提示", "请填写预设名称", parent=win)
+                return
+            if any(p["name"] == name for p in self.presets):
+                messagebox.showwarning("提示", f"已有名为「{name}」的预设，请换个名字", parent=win)
+                return
+            win.destroy()
+            self._enter_add_mode(type_var.get(), name)
+
+        btn_frm = ttk.Frame(win)
+        btn_frm.grid(row=2, column=0, columnspan=2, pady=(0, 10))
+        ttk.Button(btn_frm, text="确定", command=confirm).pack(side="left", padx=6)
+        ttk.Button(btn_frm, text="取消", command=win.destroy).pack(side="left", padx=6)
+        name_entry.focus_set()
+        win.bind("<Return>", lambda _e: confirm())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+    def _enter_add_mode(self, ptype: str, name: str):
+        """进入新增模式：草稿进内存（Esc/切预设全弃），点「存预设」才落盘"""
         self._adding = True
-        self._add_backup = (self.preset_var.get(), self.ip_var.get(), self.port_var.get())
-        self.preset_var.set("")  # 名字也清空（留空保存时自动用 ip:端口 当名字）
-        self.ip_var.set("")
-        self.port_var.set("")    # 置空即触发 trace：红框复位、旧测试结果作废
-        for w in (self.btn, self.share_btn, self.add_up_btn):
-            w.config(state="disabled")  # 半成品地址不能应用/共享，也不能加进别家预设的池
+        self._add_backup = self.preset_var.get()
+        self._draft = {"name": name, "type": ptype, "upstreams": []}
+        self.preset_var.set("")    # 不指向任何现有预设（_current_preset 会转投草稿）
+        self._test_gen += 1
+        self.test_result_var.set("")
+        # 半成品不能开代理/共享；「添加」不禁——draft 的池就靠它和回车
+        for w in (self.btn, self.share_btn):
+            w.config(state="disabled")
         # 「删除」临时变「取消」：不新增按钮，布局零变化（删除在新增模式里本来就不可用）
         self.delete_preset_btn.config(text="取消", command=self._cancel_add_mode)
         self.save_preset_btn.config(text="存预设")
-        self.ip_entry.focus_set()
+        self.ip_var.set("")
+        self.port_var.set("")      # 置空即触发 trace：红框复位、旧测试结果作废
+        self.add_var.set("")
+        self._apply_form()         # 形态按 draft 类型（multi=空池表；single=空白两格）
+        self._refresh_pool_box()
+        (self.ip_entry if ptype == "single" else self.add_entry).focus_set()
 
     def _exit_add_mode(self, restore: bool):
         self._adding = False
+        self._draft = None
         self.save_preset_btn.config(text="新增")
         self.delete_preset_btn.config(text="删除", command=self.delete_preset)
-        for w in (self.btn, self.share_btn, self.add_up_btn):
+        for w in (self.btn, self.share_btn):
             w.config(state="normal")
-        if restore:  # 取消/退出：还原进来之前的样子，别把半成品留下
-            name, ip, port = self._add_backup
-            self.preset_var.set(name)
-            self.ip_var.set(ip)
-            self.port_var.set(port)
-        self._sync_relay_upstream()
+        if restore:  # 取消/退出：回到进来之前的预设，草稿丢弃
+            self.preset_var.set(self._add_backup)
+            self._apply_form()
+            self._refresh_pool_box()
+        self._sync_pools()
 
     def _cancel_add_mode(self):
         self._exit_add_mode(restore=True)
@@ -1737,15 +1808,6 @@ class ProxyApp:
     def _valid_host(host: str) -> bool:
         """代理地址格式检查（校验逻辑已提取到模块级 _valid_host_str 共用）"""
         return _valid_host_str(host)
-
-    def _valid_inputs(self) -> bool:
-        ip = self.ip_var.get().strip()
-        if (ip and self._valid_host(ip)
-                and self._parse_port(self.port_var.get()) is not None):
-            return True
-        messagebox.showwarning("提示", "请填写正确的代理地址（IP 或主机名）和端口（1-65535）",
-                               parent=self.root)
-        return False
 
     def _pool_addrs(self) -> list:
         """当前预设的上游组 → [(ip, int(端口)), ...]"""

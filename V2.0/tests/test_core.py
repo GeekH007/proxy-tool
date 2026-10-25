@@ -306,8 +306,10 @@ class TestShortConnError(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(pt, "tk"), "tkinter 不可用时跳过")
-class TestSingleFormEdit(unittest.TestCase):
-    """单形态直接编辑的落盘判定（真 Tk，不进 mainloop；托盘/轮询/入口恢复全隔离）"""
+class _AppTest(unittest.TestCase):
+    """真 Tk 无头测试基类：不进 mainloop；托盘/轮询/入口恢复隔离，配置指到临时目录"""
+
+    CURRENT = "m"   # 启动时选中的预设（单 s / 多 m）
 
     def setUp(self):
         import tkinter as tk
@@ -316,7 +318,7 @@ class TestSingleFormEdit(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         self.cfg_path = os.path.join(tmp, "c.json")
-        cfg = {"current": "s", "share": False, "presets": [
+        cfg = {"current": self.CURRENT, "share": False, "presets": [
             {"name": "s", "type": "single", "upstreams": [["1.1.1.1", "80"]]},
             {"name": "m", "type": "multi",
              "upstreams": [["1.1.1.1", "80"], ["2.2.2.2", "80"]]}]}
@@ -343,6 +345,12 @@ class TestSingleFormEdit(unittest.TestCase):
     def _read_disk(self):
         with open(self.cfg_path, encoding="utf-8") as f:
             return json.load(f)
+
+
+class TestSingleFormEdit(_AppTest):
+    """单形态直接编辑的落盘判定"""
+
+    CURRENT = "s"
 
     def test_commit_updates_preset_and_saves(self):
         self.app.ip_var.set("9.9.9.9")
@@ -375,40 +383,8 @@ class TestSingleFormEdit(unittest.TestCase):
                          [["1.1.1.1", "80"], ["2.2.2.2", "80"]])  # 池没被污染
 
 
-@unittest.skipUnless(hasattr(pt, "tk"), "tkinter 不可用时跳过")
-class TestShowTestResult(unittest.TestCase):
+class TestShowTestResult(_AppTest):
     """逐台测试结果的分形态展示：多形态写池表 test 列，单形态写结果行"""
-
-    def setUp(self):
-        import tkinter as tk
-        self.root = tk.Tk()
-        self.root.withdraw()
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp, True)
-        cfg_path = os.path.join(tmp, "c.json")
-        cfg = {"current": "m", "share": False, "presets": [
-            {"name": "s", "type": "single", "upstreams": [["1.1.1.1", "80"]]},
-            {"name": "m", "type": "multi",
-             "upstreams": [["1.1.1.1", "80"], ["2.2.2.2", "80"]]}]}
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False)
-        patchers = [
-            mock.patch.object(pt, "CONFIG_FILE", cfg_path),
-            mock.patch.object(pt, "SETTINGS_FILE", os.path.join(tmp, "s.json")),
-            mock.patch.object(pt, "OLD_SETTINGS_FILE", os.path.join(tmp, "no_s.json")),
-            mock.patch.object(pt, "OLD_CONFIG_FILE", os.path.join(tmp, "no_c.json")),
-            mock.patch.object(pt, "LEGACY_CONFIG_FILE", os.path.join(tmp, "no_l.json")),
-            mock.patch.object(pt, "TrayIcon",
-                              mock.MagicMock(side_effect=Exception("no tray"))),
-            mock.patch.object(pt.ProxyApp, "_restore_entry"),
-            mock.patch.object(pt.ProxyApp, "_auto_refresh"),
-            mock.patch.object(pt.ProxyApp, "_pump_ui_queue"),
-        ]
-        for p in patchers:
-            p.start()
-            self.addCleanup(p.stop)
-        self.app = pt.ProxyApp(self.root)
-        self.addCleanup(self.root.destroy)
 
     def test_multi_success_writes_pool_row(self):
         self.app.preset_var.set("m")
@@ -450,6 +426,66 @@ class TestShowTestResult(unittest.TestCase):
         self.app._test_results = {}
         self.app._show_test_result(self.app._test_gen - 1, "1.1.1.1:80", True, 99, 1)
         self.assertEqual(self.app.pool_box.set("0", "test"), "")  # 作废的不写
+
+
+class TestDraftPreset(_AppTest):
+    """新增预设的 draft 缓冲语义：存才落盘，Esc/取消全弃"""
+
+    def test_draft_add_never_touches_disk(self):
+        before = self._read_disk()
+        self.app._enter_add_mode("multi", "新池")
+        self.assertTrue(self.app._adding)
+        self.assertEqual(self.app._draft["upstreams"], [])
+        self.app.add_var.set("3.3.3.3:80")
+        self.app.add_upstream()
+        self.app.add_var.set("2.2.2.2:80")
+        self.app.add_upstream()
+        self.assertEqual(self.app._draft["upstreams"], [["3.3.3.3", "80"], ["2.2.2.2", "80"]])
+        self.assertEqual(self._read_disk(), before)        # 半成品绝不落盘
+        self.app._cancel_add_mode()
+        self.assertFalse(self.app._adding)
+        self.assertNotIn("新池", [p["name"] for p in self.app.presets])
+        self.assertEqual(self._read_disk(), before)        # 取消后磁盘无痕
+
+    def test_save_multi_draft_persists_with_type(self):
+        self.app._enter_add_mode("multi", "新池")
+        self.app.add_var.set("3.3.3.3:80")
+        self.app.add_upstream()
+        self.app.on_add_or_save()
+        self.assertFalse(self.app._adding)
+        self.assertIn("新池", [p["name"] for p in self.app.presets])
+        disk = self._read_disk()
+        saved = [p for p in disk["presets"] if p["name"] == "新池"][0]
+        self.assertEqual(saved["type"], "multi")
+        self.assertEqual(saved["upstreams"], [["3.3.3.3", "80"]])
+        self.assertEqual(disk["current"], "新池")
+
+    def test_save_single_draft_persists_with_type(self):
+        self.app._enter_add_mode("single", "单台")
+        self.app.ip_var.set("9.9.9.9")
+        self.app.port_var.set("1080")
+        self.app.on_add_or_save()
+        saved = [p for p in self._read_disk()["presets"] if p["name"] == "单台"][0]
+        self.assertEqual(saved["type"], "single")
+        self.assertEqual(saved["upstreams"], [["9.9.9.9", "1080"]])
+
+    def test_save_empty_multi_draft_blocked(self):
+        with mock.patch.object(pt.messagebox, "showwarning") as warn:
+            self.app._enter_add_mode("multi", "空池")
+            self.app.on_add_or_save()
+            warn.assert_called_once()                      # 提示至少一台上游
+        self.assertTrue(self.app._adding)                  # 留在新增模式可继续
+        self.assertNotIn("空池", [p["name"] for p in self.app.presets])
+
+    def test_draft_remove_can_empty(self):
+        with mock.patch.object(pt.messagebox, "showinfo") as info:
+            self.app._enter_add_mode("multi", "新池")
+            self.app.add_var.set("3.3.3.3:80")
+            self.app.add_upstream()
+            self.app.pool_box.selection_set("0")
+            self.app.remove_upstream()
+            info.assert_not_called()                       # draft 里删到 0 不拦
+        self.assertEqual(self.app._draft["upstreams"], [])
 
 
 if __name__ == "__main__":
