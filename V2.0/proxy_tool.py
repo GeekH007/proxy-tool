@@ -1191,6 +1191,29 @@ def _friendly_conn_error(reason) -> str:
     return str(reason)
 
 
+# 测试失败进池表/状态行的精简短词（2-4 字，固定列宽装得下）
+_CONN_ERR_SHORT = {10061: "连不上", 10060: "超时", 11001: "解析失败", 10054: "被重置"}
+
+
+def _short_conn_error(reason) -> str:
+    """连接失败原因 → 精简短词；完整人话用 _friendly_conn_error（单代理状态框用）"""
+    code = getattr(reason, "errno", None) or getattr(reason, "winerror", None)
+    if code in _CONN_ERR_SHORT:
+        return _CONN_ERR_SHORT[code]
+    if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+        return "超时"
+    return "失败"
+
+
+def parse_upstream_line(text: str):
+    """'IP:端口' 单行解析：按最后一个冒号拆（IPv6 字面量维持现有校验不支持）；
+    任一环节不合法返回 None"""
+    parts = text.strip().rsplit(":", 1)
+    if len(parts) == 2 and _valid_upstream(parts[0].strip(), parts[1].strip()):
+        return parts[0].strip(), parts[1].strip()
+    return None
+
+
 # ---------- 界面 ----------
 
 class ProxyApp:

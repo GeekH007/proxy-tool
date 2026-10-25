@@ -271,5 +271,39 @@ class TestPresetTypeMigration(unittest.TestCase):
                 self.assertEqual(json.load(f)["presets"][0]["type"], "multi")
 
 
+class TestParseUpstreamLine(unittest.TestCase):
+    def test_normal(self):
+        self.assertEqual(pt.parse_upstream_line("192.130.30.73:7890"),
+                         ("192.130.30.73", "7890"))
+
+    def test_spaces_trimmed(self):
+        self.assertEqual(pt.parse_upstream_line(" 1.1.1.1 : 80 "), ("1.1.1.1", "80"))
+
+    def test_no_colon_rejected(self):
+        self.assertIsNone(pt.parse_upstream_line("1.1.1.1"))
+
+    def test_bad_port_rejected(self):
+        self.assertIsNone(pt.parse_upstream_line("1.1.1.1:0"))
+        self.assertIsNone(pt.parse_upstream_line("1.1.1.1:abc"))
+        self.assertIsNone(pt.parse_upstream_line("1.1.1.1:99999"))
+
+    def test_ipv6_literal_rejected_as_today(self):
+        self.assertIsNone(pt.parse_upstream_line("[::1]:7890"))
+
+
+class TestShortConnError(unittest.TestCase):
+    def test_known_winerror(self):
+        e = OSError(); e.winerror = 10061
+        self.assertEqual(pt._short_conn_error(e), "连不上")
+        e2 = OSError(); e2.winerror = 10060
+        self.assertEqual(pt._short_conn_error(e2), "超时")
+
+    def test_timeout_type(self):
+        self.assertEqual(pt._short_conn_error(socket.timeout("timed out")), "超时")
+
+    def test_unknown_falls_back(self):
+        self.assertEqual(pt._short_conn_error(ValueError("x")), "失败")
+
+
 if __name__ == "__main__":
     unittest.main()
