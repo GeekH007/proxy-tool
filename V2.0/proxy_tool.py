@@ -1246,6 +1246,7 @@ class ProxyApp:
         self._tray_hinted = False  # "已藏到托盘"的气泡每次运行只提示一次
         self._fw_pending = False  # 正在等 UAC/防火墙规则写入，期间忽略重复点击
         self._test_gen = 0        # 测试轮次：地址变更后旧结果（含在途）作废
+        self._test_results = {}   # "ip:port" -> (ok, ms|原因对象)，收齐 total 条才恢复按钮
         self._adding = False      # 「新增」模式：填新预设期间，开关/共享/删除暂禁用
         self._ui_queue = queue.Queue()  # 工作线程→主线程的 UI 任务队列
         self._pump_ui_queue()
@@ -1837,24 +1838,38 @@ class ProxyApp:
         try:
             opener.open(TEST_URL, timeout=3)
         except Exception as e:  # 超时、拒绝连接等统一按失败展示
-            reason = getattr(e, "reason", None) or e
-            ok, info = False, _friendly_conn_error(reason)
+            # 保留原因对象：展示层按形态决定精简短词（池表列）还是完整人话（状态框）
+            ok, info = False, getattr(e, "reason", None) or e
         else:
-            ok, info = True, f"{round((time.perf_counter() - start) * 1000)} ms"
+            ok, info = True, round((time.perf_counter() - start) * 1000)
         self._ui(lambda: self._show_test_result(gen, f"{ip}:{port}", ok, info, total))
 
-    def _show_test_result(self, gen: int, name: str, ok: bool, info: str, total: int):
+    def _show_test_result(self, gen: int, name: str, ok: bool, info, total: int):
+        """结果分形态展示：多形态写池表 test 列（✓ 毫秒/✗ 短词），
+        单形态写结果行（✗ 追加完整人话）"""
         if gen != self._test_gen:  # 结果到达前池已被改动：丢弃（按钮由收齐的末条恢复）
             return
         self._test_results[name] = (ok, info)
         if len(self._test_results) < total:
             return
         self.test_btn.config(state="normal", text="测试连通")
-        self.test_result_var.set(" ｜ ".join(f"{n} {'✓' if ok else '✗'} {t}"
-                                             for n, (ok, t) in self._test_results.items()))
-        self.test_result_label.config(foreground="#1a7f37"
-                                      if all(ok for ok, _ in self._test_results.values())
-                                      else "#c62828")
+        if self._current_preset()["type"] == "single":
+            ok1, val = next(iter(self._test_results.values()))
+            if ok1:
+                self.test_result_var.set(f"✓ {val} ms")
+                self.test_result_label.config(foreground="#1a7f37")
+            else:
+                self.test_result_var.set(
+                    f"✗ {_short_conn_error(val)}（{_friendly_conn_error(val)}）")
+                self.test_result_label.config(foreground="#c62828")
+            return
+        iid_of = {f"{ip}:{port}": str(i) for i, (ip, port) in enumerate(self._pool_addrs())}
+        for n, (ok1, val) in self._test_results.items():
+            iid = iid_of.get(n)
+            if iid and self.pool_box.exists(iid):
+                self.pool_box.set(iid, "test",
+                                  f"✓ {val} ms" if ok1 else f"✗ {_short_conn_error(val)}")
+        self.test_result_var.set("")   # 「正在测试…」清掉，多形态结果都在表里
 
     # ---- 局域网共享 ----
 

@@ -375,5 +375,82 @@ class TestSingleFormEdit(unittest.TestCase):
                          [["1.1.1.1", "80"], ["2.2.2.2", "80"]])  # 池没被污染
 
 
+@unittest.skipUnless(hasattr(pt, "tk"), "tkinter 不可用时跳过")
+class TestShowTestResult(unittest.TestCase):
+    """逐台测试结果的分形态展示：多形态写池表 test 列，单形态写结果行"""
+
+    def setUp(self):
+        import tkinter as tk
+        self.root = tk.Tk()
+        self.root.withdraw()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg_path = os.path.join(tmp, "c.json")
+        cfg = {"current": "m", "share": False, "presets": [
+            {"name": "s", "type": "single", "upstreams": [["1.1.1.1", "80"]]},
+            {"name": "m", "type": "multi",
+             "upstreams": [["1.1.1.1", "80"], ["2.2.2.2", "80"]]}]}
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        patchers = [
+            mock.patch.object(pt, "CONFIG_FILE", cfg_path),
+            mock.patch.object(pt, "SETTINGS_FILE", os.path.join(tmp, "s.json")),
+            mock.patch.object(pt, "OLD_SETTINGS_FILE", os.path.join(tmp, "no_s.json")),
+            mock.patch.object(pt, "OLD_CONFIG_FILE", os.path.join(tmp, "no_c.json")),
+            mock.patch.object(pt, "LEGACY_CONFIG_FILE", os.path.join(tmp, "no_l.json")),
+            mock.patch.object(pt, "TrayIcon",
+                              mock.MagicMock(side_effect=Exception("no tray"))),
+            mock.patch.object(pt.ProxyApp, "_restore_entry"),
+            mock.patch.object(pt.ProxyApp, "_auto_refresh"),
+            mock.patch.object(pt.ProxyApp, "_pump_ui_queue"),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        self.app = pt.ProxyApp(self.root)
+        self.addCleanup(self.root.destroy)
+
+    def test_multi_success_writes_pool_row(self):
+        self.app.preset_var.set("m")
+        self.app._apply_form()
+        self.app._refresh_pool_box()
+        self.app._test_results = {}
+        g = self.app._test_gen
+        self.app._show_test_result(g, "1.1.1.1:80", True, 210, 2)
+        self.app._show_test_result(g, "2.2.2.2:80", True, 320, 2)
+        self.assertEqual(self.app.pool_box.set("0", "test"), "✓ 210 ms")
+        self.assertEqual(self.app.pool_box.set("1", "test"), "✓ 320 ms")
+        self.assertEqual(self.app.test_btn["text"], "测试连通")   # 收齐恢复按钮
+
+    def test_multi_failure_uses_short_word(self):
+        self.app.preset_var.set("m")
+        self.app._apply_form()
+        self.app._refresh_pool_box()
+        self.app._test_results = {}
+        g = self.app._test_gen
+        reason = OSError(); reason.winerror = 10061
+        self.app._show_test_result(g, "1.1.1.1:80", False, reason, 1)
+        self.assertEqual(self.app.pool_box.set("0", "test"), "✗ 连不上")
+
+    def test_single_result_shows_in_label(self):
+        self.app.preset_var.set("s")
+        self.app._apply_form()
+        self.app._test_results = {}
+        g = self.app._test_gen
+        reason = OSError(); reason.winerror = 10060
+        self.app._show_test_result(g, "1.1.1.1:80", False, reason, 1)
+        text = self.app.test_result_var.get()
+        self.assertIn("✗ 超时", text)
+        self.assertIn("无响应", text)                    # 完整人话也带上
+
+    def test_stale_gen_discarded(self):
+        self.app.preset_var.set("m")
+        self.app._apply_form()
+        self.app._refresh_pool_box()
+        self.app._test_results = {}
+        self.app._show_test_result(self.app._test_gen - 1, "1.1.1.1:80", True, 99, 1)
+        self.assertEqual(self.app.pool_box.set("0", "test"), "")  # 作废的不写
+
+
 if __name__ == "__main__":
     unittest.main()
