@@ -447,6 +447,13 @@ class TestDraftPreset(_AppTest):
         self.assertNotIn("新池", [p["name"] for p in self.app.presets])
         self.assertEqual(self._read_disk(), before)        # 取消后磁盘无痕
 
+    def test_add_mode_shows_draft_name_in_preset_box(self):
+        # 弹窗里填的名称要实时显示在主窗口预设下拉（set("") 会让用户以为名称没用）
+        self.app._enter_add_mode("multi", "新池")
+        self.assertEqual(self.app.preset_var.get(), "新池")
+        self.app._cancel_add_mode()                         # 取消恢复原来的预设显示
+        self.assertEqual(self.app.preset_var.get(), "m")
+
     def test_save_multi_draft_persists_with_type(self):
         self.app._enter_add_mode("multi", "新池")
         self.app.add_var.set("3.3.3.3:80")
@@ -557,6 +564,63 @@ class TestLayoutAlignment(_AppTest):
         self.app.add_upstream()
         self.assertEqual(str(self.app.test_btn.cget("state")), "normal")
         self.assertEqual(self.app.test_btn["text"], "测试连通")
+
+    def test_check_and_radio_use_big_indicator(self):
+        # 主题指示器小且 clam 画叉、经典控件指示器绑死字体（用户实测三连反馈）：
+        # 换自绘 20px 位图指示器，文字大小不受影响
+        import tkinter as tk
+        self.assertEqual(self.app.autostart_cb.winfo_class(), "TCheckbutton")
+        self.assertEqual(str(self.app.autostart_cb.cget("style")), "Big.TCheckbutton")
+        self.app._open_new_preset_dialog()
+        self.root.update_idletasks()
+        top = [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+        radios = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                if c.winfo_class() == "TRadiobutton":
+                    radios.append(c)
+                walk(c)
+
+        walk(top)
+        self.assertEqual(len(radios), 2)
+        for r in radios:
+            self.assertEqual(str(r.cget("style")), "Big.TRadiobutton")
+        for name, img in self.app._ind_imgs.items():
+            self.assertEqual((img.width(), img.height()), (20, 20), f"{name} 指示器应 20px")
+
+
+class TestDialogPolish(_AppTest):
+    """弹窗细节：新增预设弹窗居中于主窗口（不再冒在屏幕左上角）、客户端窗列宽"""
+
+    def test_new_preset_dialog_centers_over_main(self):
+        import tkinter as tk
+        # 主窗口挪离屏幕角：不挪的话弹窗默认位置也在 (0,0) 附近，测试会假通过
+        self.root.geometry("+300+250")
+        self.root.deiconify()   # setUp 里 withdraw 的窗口 winfo_root*=0，得先映射回来
+        self.addCleanup(self.root.withdraw)
+        self.root.update()
+        self.app._open_new_preset_dialog()
+        self.root.update_idletasks()
+        win = [w for w in self.root.winfo_children()
+               if isinstance(w, tk.Toplevel)][-1]      # 最新弹出的 Toplevel
+        rx, rw = self.root.winfo_rootx(), self.root.winfo_width()
+        ry, rh = self.root.winfo_rooty(), self.root.winfo_height()
+        cx, cy = win.winfo_rootx() + win.winfo_width() / 2, \
+                 win.winfo_rooty() + win.winfo_height() / 2
+        self.assertTrue(rx <= cx <= rx + rw, f"弹窗中心 x={cx} 不在主窗口 {rx}~{rx+rw}")
+        self.assertTrue(ry <= cy <= ry + rh, f"弹窗中心 y={cy} 不在主窗口 {ry}~{ry+rh}")
+
+    def test_clients_columns_wider(self):
+        # 430px 的窄表放不下 IP/速率/最后活跃同排：列整体加宽
+        from tkinter import ttk
+        self.app.open_clients()
+        self.addCleanup(self.app._clients_win.destroy)
+        self.root.update_idletasks()
+        tv = next(w for w in self.app._clients_win.winfo_children()
+                  if isinstance(w, ttk.Treeview))
+        total = sum(tv.column(c, "width") for c in ("ip", "conns", "down", "up", "last"))
+        self.assertGreaterEqual(total, 500, f"客户端表总宽 {total}px，仍太窄")
 
 
 if __name__ == "__main__":

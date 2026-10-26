@@ -3,6 +3,7 @@
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import os
 import queue
 import shutil
@@ -1217,6 +1218,44 @@ def parse_upstream_line(text: str):
 
 # ---------- 界面 ----------
 
+
+def _indicator_images(root, bg: str) -> dict:
+    """自绘 20px 复选/单选指示器位图，替代主题指示器（clam 画叉、经典控件
+    指示器绑死字体高度都不可控）；cb0/cb1=复选未选/选中，rb0/rb1=单选未选/选中"""
+    size, border, blue, white = 20, "#707070", "#0078d4", "#ffffff"
+
+    def seg_d(px, py, ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    def make(kind: str) -> tk.PhotoImage:
+        img = tk.PhotoImage(master=root, width=size, height=size)
+        rows = []
+        for y in range(size):
+            row = []
+            for x in range(size):
+                px, py = x + 0.5, y + 0.5
+                d = math.hypot(px - 10, py - 10)
+                c = bg                                  # 圈外填界面底色，视觉无缝
+                if kind.startswith("rb"):               # 单选：2px 灰环 + 选中蓝点
+                    if d <= 9.5:
+                        c = border if d > 7.2 else (blue if kind == "rb1" and d <= 5.0 else white)
+                else:                                    # 复选：2px 灰框，选中蓝底白勾
+                    inb = 1.5 <= px <= 18.5 and 1.5 <= py <= 18.5
+                    if inb:
+                        c = border if kind == "cb0" and not (3.5 <= px <= 16.5 and 3.5 <= py <= 16.5) else (
+                            blue if kind == "cb1" else white)
+                        if kind == "cb1" and (seg_d(px, py, 5.5, 10.5, 8.8, 13.8) < 1.7
+                                              or seg_d(px, py, 8.2, 13.2, 14.5, 6.2) < 1.7):
+                            c = white
+                row.append(c)
+            rows.append("{" + " ".join(row) + "}")
+        img.put(" ".join(rows), to=(0, 0, size, size))
+        return img
+
+    return {k: make(k) for k in ("cb0", "cb1", "rb0", "rb1")}
+
 class ProxyApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1233,6 +1272,19 @@ class ProxyApp:
         style.map("Off.TButton", background=[("active", "#cdeacd"), ("pressed", "#c0e3c0")])
         # 输入框校验红框
         style.configure("Invalid.TEntry", fieldbackground="#ffdcdc")
+        # 指示器放大：自绘 20px 位图（勾/圆点）替换主题指示器，文字大小不受影响
+        self._ind_imgs = _indicator_images(root, self._bg)
+        style.element_create("BigCb.indicator", "image",
+                             self._ind_imgs["cb0"], ("selected", self._ind_imgs["cb1"]))
+        style.element_create("BigRb.indicator", "image",
+                             self._ind_imgs["rb0"], ("selected", self._ind_imgs["rb1"]))
+        for ctl, ind in (("Checkbutton", "BigCb"), ("Radiobutton", "BigRb")):
+            style.layout(f"Big.T{ctl}",
+                [(f"{ctl}.padding", {"sticky": "nswe", "children": [
+                    (f"{ind}.indicator", {"side": "left", "sticky": ""}),
+                    (f"{ctl}.focus", {"side": "left",
+                                      "sticky": "w" if ctl == "Checkbutton" else "",
+                                      "children": [(f"{ctl}.label", {"sticky": "nswe"})]})]})])
         root.title(APP_TITLE)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1372,9 +1424,10 @@ class ProxyApp:
                                 sticky="ew", padx=12, pady=(2, 2))  # 主功能/辅助设置分区
 
         self.autostart_var = tk.BooleanVar(value=get_autostart())
-        ttk.Checkbutton(frm, text="开机自动启动", variable=self.autostart_var,
-                       command=self.toggle_autostart).grid(
-            row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
+        self.autostart_cb = ttk.Checkbutton(
+            frm, text="开机自动启动", variable=self.autostart_var,
+            command=self.toggle_autostart, style="Big.TCheckbutton")
+        self.autostart_cb.grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
 
         ttk.Label(frm, text="局域网共享").grid(row=10, column=0, sticky="e", **pad)
         share_frm = ttk.Frame(frm)
@@ -1613,10 +1666,11 @@ class ProxyApp:
         ttk.Label(win, text="类型").grid(row=0, column=0, sticky="e", padx=12, pady=8)
         type_frm = ttk.Frame(win)
         type_frm.grid(row=0, column=1, sticky="w", padx=12, pady=8)
-        ttk.Radiobutton(type_frm, text="单代理（一个地址）",
-                        variable=type_var, value="single").pack(side="left")
-        ttk.Radiobutton(type_frm, text="多代理（上游池，按连接分流）",
-                        variable=type_var, value="multi").pack(side="left", padx=(8, 0))
+        for txt, val in (("单代理（一个地址）", "single"),
+                         ("多代理（上游池，按连接分流）", "multi")):
+            ttk.Radiobutton(type_frm, text=txt, variable=type_var, value=val,
+                            style="Big.TRadiobutton"
+                            ).pack(side="left", padx=(8, 0) if val == "multi" else 0)
         ttk.Label(win, text="名称").grid(row=1, column=0, sticky="e", padx=12, pady=8)
         name_entry = ttk.Entry(win, textvariable=name_var, width=20)
         name_entry.grid(row=1, column=1, sticky="w", padx=12, pady=8)
@@ -1639,13 +1693,15 @@ class ProxyApp:
         name_entry.focus_set()
         win.bind("<Return>", lambda _e: confirm())
         win.bind("<Escape>", lambda _e: win.destroy())
+        self._center_over(win)   # 居中于主窗口（其余弹窗同款），别冒在屏幕左上角
 
     def _enter_add_mode(self, ptype: str, name: str):
         """进入新增模式：草稿进内存（Esc/切预设全弃），点「存预设」才落盘"""
         self._adding = True
         self._add_backup = self.preset_var.get()
         self._draft = {"name": name, "type": ptype, "upstreams": []}
-        self.preset_var.set("")    # 不指向任何现有预设（_current_preset 会转投草稿）
+        # 下拉框实时显示草稿名（名称看得见去处；_current_preset 认 _draft 不认这个值）
+        self.preset_var.set(name)
         self._invalidate_test_results()
         # 半成品不能开代理/共享；「添加」不禁——draft 的池就靠它和回车
         for w in (self.btn, self.share_btn):
@@ -2271,9 +2327,9 @@ class ProxyApp:
         win.resizable(False, False)
         win.transient(self.root)
         tv = ttk.Treeview(win, columns=("ip", "conns", "down", "up", "last"), show="headings", height=8)
-        for col, text, width in (("ip", "设备 IP", 130), ("conns", "连接", 50),
-                                 ("down", "↓ 速率", 85), ("up", "↑ 速率", 85),
-                                 ("last", "最后活跃", 80)):
+        for col, text, width in (("ip", "设备 IP", 150), ("conns", "连接", 56),
+                                 ("down", "↓ 速率", 100), ("up", "↑ 速率", 100),
+                                 ("last", "最后活跃", 96)):
             tv.heading(col, text=text)
             tv.column(col, width=width, anchor="w" if col == "ip" else "center")
         tv.pack(padx=10, pady=(10, 4))
