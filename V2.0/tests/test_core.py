@@ -131,6 +131,104 @@ class TestHttpServer(unittest.TestCase):
         self.assertEqual(bu, 4); self.assertEqual(bd, 2)    # 上行=ping 4B，下行=ok 2B
         self.assertEqual(conns, 0)                          # 连接已结束
 
+    def test_dial_timeout_3s(self):
+        # 拨上游超时 5→3 秒：两台全坏的最坏等待 10s→6s（本机→VPN 内网 RTT 低，3s 足够）
+        real = socket.create_connection
+        with mock.patch.object(pt.socket, "create_connection", wraps=real) as cc:
+            self._connect_entry()
+            self.assertEqual(cc.call_args.kwargs.get("timeout"), pt.DIAL_TIMEOUT_SECS)
+            self.assertEqual(pt.DIAL_TIMEOUT_SECS, 3)
+
+
+class TestAcceptBacklog(unittest.TestCase):
+    """accept backlog 16→128：浏览器/多设备瞬时并发不丢 SYN 触发重传"""
+
+    def _assert_backlog(self, make):
+        with mock.patch.object(pt.socket, "socket") as cls:
+            inst = cls.return_value
+            inst.accept.side_effect = OSError("mock: 不进转发路径")
+            srv = make()
+            srv.start()
+            srv.stop()
+            inst.listen.assert_called_once_with(128)
+
+    def test_http(self):
+        self._assert_backlog(lambda: pt.HttpServer(1, pt.UpstreamPool([("127.0.0.1", 1)])))
+
+    def test_relay(self):
+        self._assert_backlog(lambda: pt.RelayServer(1, ("127.0.0.1", 1)))
+
+    def test_socks(self):
+        self._assert_backlog(lambda: pt.SocksServer(1, ("127.0.0.1", 1)))
+
+    def test_relay_dial_timeout_3s(self):
+        ups = FakeUpstream(); ups.start()
+        srv = pt.RelayServer(_free_port(), ups.addr); srv.start()
+        try:
+            real = socket.create_connection
+            with mock.patch.object(pt.socket, "create_connection", wraps=real) as cc:
+                c = socket.create_connection(("127.0.0.1", srv.listen_port), timeout=5)
+                c.sendall(b"x"); c.recv(64); c.close()
+                self.assertEqual(cc.call_args.kwargs.get("timeout"), pt.DIAL_TIMEOUT_SECS)
+        finally:
+            srv.stop(); ups.srv.close()
+
+
+class TestPipeTuning(unittest.TestCase):
+    """转发层公共管道与 socket 调优：批量入账不丢账、NODELAY/缓冲区生效"""
+
+    def test_tune_sock_sets_nodelay_and_buffers(self):
+        s = socket.socket()
+        try:
+            pt._tune_sock(s)
+            self.assertEqual(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+            self.assertGreaterEqual(s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF),
+                                    256 * 1024)   # 平台可能放大，只要求不小于请求值
+            self.assertGreaterEqual(s.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF),
+                                    256 * 1024)
+        finally:
+            s.close()
+
+    def test_pipe_sockets_bulk_flush_full_accounting(self):
+        # 700KB 过管道：批量入账（次数少）+ 断开时尾量冲账，总账一字节不差
+        s1, s2 = socket.socketpair()
+        s3, s4 = socket.socketpair()
+        counted = []
+        th = threading.Thread(target=pt._pipe_sockets,
+                              args=(s2, s3, lambda n: counted.append(n)), daemon=True)
+        th.start()
+        payload = b"x" * 700_000
+        s1.sendall(payload)
+        s1.shutdown(socket.SHUT_WR)          # 触发 pipe 侧 EOF → 尾量 flush + 半关写端
+        got = bytearray()
+        while True:
+            chunk = s4.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+        th.join(5)
+        self.assertEqual(bytes(got), payload)        # 数据一字节不少
+        self.assertEqual(sum(counted), len(payload)) # 总账全对
+        self.assertLessEqual(len(counted), 4)        # 700KB 只入账 ≤4 次（非逐块抢锁）
+
+    def test_http_entry_tunes_both_sockets(self):
+        # 入口转发两端（客户端侧+上游侧）都要吃到调优
+        ups = FakeUpstream(); ups.start()
+        pool = pt.UpstreamPool([ups.addr])
+        srv = pt.HttpServer(_free_port(), pool); srv.start()
+        try:
+            with mock.patch.object(pt, "_tune_sock") as tune:
+                c, resp = socket.create_connection(
+                    ("127.0.0.1", srv.listen_port), timeout=5), None
+                c.sendall(b"ping")
+                resp = c.recv(4096)
+                c.close()
+                time.sleep(0.2)
+            self.assertEqual(resp, b"ok")
+            self.assertGreaterEqual(tune.call_count, 2)   # client + up 各一次
+        finally:
+            srv.stop(); ups.srv.close()
+
 
 class TestConfigMigration(unittest.TestCase):
     def test_legacy_preset_migrates(self):

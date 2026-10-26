@@ -41,6 +41,8 @@ APP_VERSION = "V2.0"        # 版本号进标题栏，一眼区分跑的是哪�
 APP_TITLE = f"系统代理工具 {APP_VERSION}"
 MUTEX_NAME = "MyXm_ProxyTool_SingleInstance"
 TEST_URL = "http://www.gstatic.com/generate_204"
+DIAL_TIMEOUT_SECS = 3   # 拨上游限时：本机→上游 RTT 低，超时短促让故障切换不干等
+ACCEPT_BACKLOG = 128    # listen 积压：浏览器/多设备瞬时并发不丢 SYN 触发重传
 REFRESH_INTERVAL_MS = 2000
 ACTIVE_WINDOW_SEC = 600   # “近10分钟活跃设备”的统计窗口
 DEVICE_TTL_SEC = 3600     # 设备记录保留时长，超时清理
@@ -444,6 +446,44 @@ class UpstreamPool:
             self._fails.pop(up, None)
 
 
+def _tune_sock(sock):
+    """转发 socket 通用调优：关 Nagle（交互小包立即发，省 40ms 级延迟）+
+    收发缓冲 256KB（30M×30ms 链路 BDP ~110KB，默认 64KB 卡单流吞吐）；
+    平台不支持任一项就静默用默认值跑"""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+    except OSError:
+        pass
+
+
+def _pipe_sockets(src, dst, flush):
+    """双向搬运的公共实现（Relay/Socks/Http 三处共用）：recv→sendall 直到
+    任一端断开，随后半关写端让对端收完尾包。flush(n) 每 256KB 批量回调一次
+    （热路径不逐块抢统计锁），EOF/异常时冲掉尾量，总账一字节不差"""
+    acc = 0
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+            acc += len(data)
+            if acc >= 262144:
+                flush(acc)
+                acc = 0
+    except OSError:
+        pass
+    finally:
+        if acc:
+            flush(acc)
+        try:
+            dst.shutdown(socket.SHUT_WR)  # 半关，让对面把剩余数据收完
+        except OSError:
+            pass
+
+
 class RelayServer:
     """把 0.0.0.0:listen_port 收到的 TCP 连接原样搬给上游代理（不解协议）"""
 
@@ -463,7 +503,7 @@ class RelayServer:
         srv = socket.socket()
         try:
             srv.bind(("0.0.0.0", self.listen_port))
-            srv.listen(16)
+            srv.listen(ACCEPT_BACKLOG)
         except OSError:
             srv.close()
             raise
@@ -497,6 +537,7 @@ class RelayServer:
                 client, _ = srv.accept()
             except OSError:
                 break  # stop() 关闭监听后会走到这
+            _tune_sock(client)   # 关 Nagle+加大缓冲，交互小包不等攒包
             threading.Thread(target=self._pump, args=(client,), daemon=True).start()
 
     def _pump(self, client):
@@ -513,7 +554,7 @@ class RelayServer:
             with self._lock:
                 self._live.add(t_pending)  # 拨上游前就登记，stop() 才掐得到在途连接
             try:
-                up = socket.create_connection(self.upstream, timeout=5)
+                up = socket.create_connection(self.upstream, timeout=DIAL_TIMEOUT_SECS)
             except OSError:
                 client.close()  # 上游连不上，别让客户端 socket 干等
                 return
@@ -521,6 +562,7 @@ class RelayServer:
                 with self._lock:
                     self._live.discard(t_pending)
             up.settimeout(None)  # 否则上游 keep-alive 空闲会被 5 秒超时打断
+            _tune_sock(up)
             pair = (client, up)
             with self._lock:
                 self._live.add(pair)
@@ -556,28 +598,16 @@ class RelayServer:
             return self.active_conns, devs, (self.bytes_down, self.bytes_up)
 
     def _pipe(self, src, dst, dev, down: bool):
-        """双向搬运字节；down=True 表示 dst 是客户端（下行）。字节计数拿锁入账"""
-        try:
-            while True:
-                data = src.recv(65536)
-                if not data:
-                    break
-                dst.sendall(data)
-                n = len(data)
-                with self._lock:
-                    if down:
-                        self.bytes_down += n
-                        dev["bd"] += n
-                    else:
-                        self.bytes_up += n
-                        dev["bu"] += n
-        except OSError:
-            pass
-        finally:
-            try:
-                dst.shutdown(socket.SHUT_WR)  # 半关，让对面把剩余数据收完
-            except OSError:
-                pass
+        """双向搬运字节；down=True 表示 dst 是客户端（下行）。计账批量入锁"""
+        def flush(n):
+            with self._lock:
+                if down:
+                    self.bytes_down += n
+                    dev["bd"] += n
+                else:
+                    self.bytes_up += n
+                    dev["bu"] += n
+        _pipe_sockets(src, dst, flush)
 
 
 # ---------- SOCKS5 网关（桥接到 HTTP 上游代理） ----------
@@ -596,7 +626,7 @@ class SocksServer:
     上游只认 HTTP 代理时的协议转换网关：对上游发 CONNECT，200 后双向搬字节。
     启停/记账/管道结构与 RelayServer 同款。"""
 
-    HANDSHAKE_TIMEOUT = 5  # 握手+拨上游限时；隧道接通后两边都清掉
+    HANDSHAKE_TIMEOUT = 5  # 客户端握手限时（拨上游另有 DIAL_TIMEOUT_SECS）；隧道接通后清掉
 
     def __init__(self, listen_port: int, upstream: tuple, user: str = "", password: str = ""):
         self.listen_port = listen_port
@@ -617,7 +647,7 @@ class SocksServer:
         srv = socket.socket()
         try:
             srv.bind(("0.0.0.0", self.listen_port))
-            srv.listen(16)
+            srv.listen(ACCEPT_BACKLOG)
         except OSError:
             srv.close()
             raise
@@ -650,6 +680,7 @@ class SocksServer:
                 client, _ = srv.accept()
             except OSError:
                 break
+            _tune_sock(client)   # 关 Nagle+加大缓冲，交互小包不等攒包
             threading.Thread(target=self._pump, args=(client,), daemon=True).start()
 
     def snapshot(self):
@@ -733,7 +764,8 @@ class SocksServer:
 
     def _dial_upstream(self, client, target: str):
         """对 HTTP 上游发 CONNECT，200 后回 SOCKS 成功，返回已接通的上游 socket"""
-        up = socket.create_connection(self.upstream, timeout=self.HANDSHAKE_TIMEOUT)
+        up = socket.create_connection(self.upstream, timeout=DIAL_TIMEOUT_SECS)
+        _tune_sock(up)   # 握手与隧道都吃 NODELAY/大缓冲
         try:
             up.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii"))
             resp = b""
@@ -785,6 +817,7 @@ class SocksServer:
                     self._reply(client, 1)
                     return
                 up.settimeout(None)      # 同 RelayServer：超时不得残留到长连接
+                _tune_sock(up)
                 client.settimeout(None)
                 pair = (client, up)
                 with self._lock:
@@ -814,27 +847,15 @@ class SocksServer:
                 self.active_conns -= 1
 
     def _pipe(self, src, dst, dev, down: bool):  # 同 RelayServer._pipe，含字节计数
-        try:
-            while True:
-                data = src.recv(65536)
-                if not data:
-                    break
-                dst.sendall(data)
-                n = len(data)
-                with self._lock:
-                    if down:
-                        self.bytes_down += n
-                        dev["bd"] += n
-                    else:
-                        self.bytes_up += n
-                        dev["bu"] += n
-        except OSError:
-            pass
-        finally:
-            try:
-                dst.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+        def flush(n):
+            with self._lock:
+                if down:
+                    self.bytes_down += n
+                    dev["bd"] += n
+                else:
+                    self.bytes_up += n
+                    dev["bu"] += n
+        _pipe_sockets(src, dst, flush)
 
 
 def _merge_devs(a, b):
@@ -883,7 +904,7 @@ class HttpServer:
         srv = socket.socket()
         try:
             srv.bind(("127.0.0.1", self.listen_port))  # 只服务本机；绑 0.0.0.0 等于给局域网开免费通道
-            srv.listen(16)
+            srv.listen(ACCEPT_BACKLOG)
         except OSError:
             srv.close()
             raise
@@ -916,6 +937,7 @@ class HttpServer:
                 client, _ = srv.accept()
             except OSError:
                 break
+            _tune_sock(client)   # 关 Nagle+加大缓冲，交互小包不等攒包
             threading.Thread(target=self._pump, args=(client,), daemon=True).start()
 
     def _pump(self, client):
@@ -929,7 +951,7 @@ class HttpServer:
                 up = None
                 for cand in self.pool.order():
                     try:
-                        up = socket.create_connection(cand, timeout=5)
+                        up = socket.create_connection(cand, timeout=DIAL_TIMEOUT_SECS)
                     except OSError:
                         self.pool.report_fail(cand)
                         continue
@@ -942,6 +964,7 @@ class HttpServer:
                 with self._lock:
                     self._live.discard(t_pending)
             up.settimeout(None)  # create_connection 的 timeout 会残留到 recv，掐断 keep-alive
+            _tune_sock(up)
             pair = (client, up)
             with self._lock:
                 self._live.add(pair)
@@ -972,25 +995,13 @@ class HttpServer:
 
     def _pipe(self, src, dst, st, down: bool):
         """同 RelayServer._pipe，改按上游入账；down=True 表示 dst 是客户端（下行）"""
-        try:
-            while True:
-                data = src.recv(65536)
-                if not data:
-                    break
-                dst.sendall(data)
-                n = len(data)
-                with self._lock:
-                    if down:
-                        st["bd"] += n
-                    else:
-                        st["bu"] += n
-        except OSError:
-            pass
-        finally:
-            try:
-                dst.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+        def flush(n):
+            with self._lock:
+                if down:
+                    st["bd"] += n
+                else:
+                    st["bu"] += n
+        _pipe_sockets(src, dst, flush)
 
 
 # ---------- 应用设置（共享端口、SOCKS5、配置文件路径） ----------
