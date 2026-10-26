@@ -515,7 +515,9 @@ class TestShowTestResult(_AppTest):
         self.app._show_test_result(g, "1.1.1.1:80", False, reason, 1)
         text = self.app.test_result_var.get()
         self.assertIn("✗ 超时", text)
-        self.assertIn("无响应", text)                    # 完整人话也带上
+        self.assertIn("查看详情", text)                   # 完整人话移进了详情弹窗
+        # 详情弹窗里保留逐台完整人话
+        self.assertIn("无响应", pt._friendly_conn_error(reason))
 
     def test_stale_gen_discarded(self):
         self.app.preset_var.set("m")
@@ -719,6 +721,174 @@ class TestDialogPolish(_AppTest):
                   if isinstance(w, ttk.Treeview))
         total = sum(tv.column(c, "width") for c in ("ip", "conns", "down", "up", "last"))
         self.assertGreaterEqual(total, 500, f"客户端表总宽 {total}px，仍太窄")
+
+
+class TestUpstreamPoolV2(unittest.TestCase):
+    """负载感知与原子占位：连接少的优先、占位即计负载、失败节点恢复探测单飞、
+    池代际隔离（切预设后旧拨号结果不污染新池）"""
+
+    def _pool(self, ups):
+        self.clk = FakeClock()
+        return pt.UpstreamPool(ups, clock=self.clk)
+
+    def test_least_loaded_first(self):
+        pool = self._pool([("1.1.1.1", 1), ("2.2.2.2", 2)])
+        x, y = ("1.1.1.1", 1), ("2.2.2.2", 2)
+        up1, t1 = pool.acquire_attempt(set())     # 占位即计负载
+        self.assertEqual(up1, x)
+        up2, _ = pool.acquire_attempt(set())      # x 负载 1 → 选 y
+        self.assertEqual(up2, y)
+        pool.release_attempt(t1)                  # 归还后 x 负载归零
+        up3, _ = pool.acquire_attempt(set())      # y 负载 1 → 回到 x
+        self.assertEqual(up3, x)
+
+    def test_acquire_excludes_tried(self):
+        pool = self._pool([("1.1.1.1", 1), ("2.2.2.2", 2)])
+        up, _ = pool.acquire_attempt({("1.1.1.1", 1)})   # 换下一台时排除已试过的
+        self.assertEqual(up, ("2.2.2.2", 2))
+
+    def test_first_fail_short_degrade(self):
+        pool = self._pool([("1.1.1.1", 1), ("2.2.2.2", 2)])
+        pool.report_fail(("1.1.1.1", 1))
+        self.assertEqual(pool.order()[0], ("2.2.2.2", 2))  # 首败 1 秒降级：不作首选
+        self.assertIn(("1.1.1.1", 1), pool.order())        # 仍在列可兜底
+        self.clk.advance(2)
+        self.assertEqual(pool.order()[0], ("1.1.1.1", 1))  # 过 1 秒即恢复
+
+    def test_recovery_single_flight(self):
+        pool = self._pool([("1.1.1.1", 1)])
+        x = ("1.1.1.1", 1)
+        pool.report_fail(x)
+        t1 = pool.begin_attempt(x)      # 失败过的节点：首个连接成为恢复探测
+        self.assertIsNotNone(t1)
+        self.assertIsNone(pool.begin_attempt(x))          # 探测在途：单飞，其他跳过
+        pool.finish_attempt(x, t1, True)
+        self.assertIsNotNone(pool.begin_attempt(x))       # 探测成功：恢复并行
+
+    def test_generation_isolation(self):
+        pool = self._pool([("1.1.1.1", 1), ("2.2.2.2", 2)])
+        x = ("1.1.1.1", 1)
+        _, token = pool.acquire_attempt(set())
+        pool.set([x, ("2.2.2.2", 2)])   # 换代：旧拨号的成败都不得写进新池
+        pool.finish_attempt(x, token, False)
+        self.assertEqual(pool.order()[0], ("1.1.1.1", 1))  # 新池未被旧失败降级
+
+    def test_set_dedup(self):
+        pool = self._pool([("1.1.1.1", 1), ("1.1.1.1", 1), ("2.2.2.2", 2)])
+        self.assertEqual(len(pool.order()), 2)             # 重复上游去重
+
+
+class TestProbeUpstream(unittest.TestCase):
+    """_probe_upstream：显式 CONNECT+TLS 双站点探测与错误分类"""
+
+    def test_all_targets_fail_aggregates(self):
+        ok, err = pt._probe_upstream("127.0.0.1", _free_port())   # 无监听端口
+        self.assertFalse(ok)
+        self.assertIsInstance(err, pt._ConnectivityFailure)
+        self.assertEqual(len(err.attempts), 2)          # 两个站点都试过
+
+    def test_short_words_new_categories(self):
+        import http.client
+        import ssl
+        self.assertEqual(pt._short_conn_error(pt._ProbeHttpError(503)), "HTTP503")
+        self.assertEqual(pt._short_conn_error(
+            ssl.SSLCertVerificationError(1, "verify failed")), "证书错误")
+        self.assertEqual(pt._short_conn_error(
+            OSError("Tunnel connection failed: 403 Forbidden")), "隧道拒绝")
+        self.assertEqual(pt._short_conn_error(
+            http.client.HTTPException("bad state")), "协议错误")
+        e1 = OSError(10061, "refused")
+        both = pt._ConnectivityFailure([("A", e1), ("B", e1)])
+        self.assertEqual(pt._short_conn_error(both), "连不上")     # 同因取一词
+        mixed = pt._ConnectivityFailure([("A", e1), ("B", OSError(10060, "t"))])
+        self.assertEqual(pt._short_conn_error(mixed), "测试未通")  # 异因汇总
+        self.assertIn("A：", pt._friendly_conn_error(mixed))       # 详情逐站点展开
+
+    def test_probe_success_via_real_tls(self):
+        import ssl
+        import subprocess
+        if not shutil.which("openssl"):
+            self.skipTest("环境无 openssl，跳过真实 TLS 链路")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cert, key = (os.path.join(tmp, n) for n in ("c.pem", "k.pem"))
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-subj", "/CN=www.google.com", "-keyout", key, "-out", cert],
+            check=True, capture_output=True)
+
+        lsock = socket.socket()
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen(2)
+        port = lsock.getsockname()[1]
+
+        def serve():   # 伪代理：回 CONNECT 200 后做 TLS 服务端，应答 204
+            try:
+                raw, _ = lsock.accept()
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    buf += raw.recv(4096)
+                raw.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(cert, key)
+                tls = ctx.wrap_socket(raw, server_side=True)
+                tls.recv(8192)
+                tls.sendall(b"HTTP/1.1 204 No Content\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                tls.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        trust = ssl.create_default_context(cafile=cert)   # 只信这把自签证书
+        with mock.patch.object(pt.ssl, "create_default_context", return_value=trust):
+            ok, ms = pt._probe_upstream("127.0.0.1", port)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(ms, 0)
+        lsock.close()
+
+
+class TestForwardSlots(unittest.TestCase):
+    """三入口共享连接上限：满了拒绝并计数，连接结束槽位归还"""
+
+    def test_limit_rejects_then_recovers(self):
+        ups = FakeUpstream(); ups.start()
+        pool = pt.UpstreamPool([ups.addr])
+        srv = pt.HttpServer(_free_port(), pool); srv.start()
+        try:
+            with mock.patch.object(pt, "_FORWARD_SLOTS",
+                                   threading.BoundedSemaphore(1)):
+                c1 = socket.create_connection(("127.0.0.1", srv.listen_port), timeout=5)
+                c1.sendall(b"ping")                 # 占住唯一槽位（保持连接）
+                time.sleep(0.2)
+                c2 = socket.create_connection(("127.0.0.1", srv.listen_port), timeout=5)
+                self.assertEqual(c2.recv(64), b"")  # 超限连接被立即关闭
+                self.assertEqual(srv.rejected_conns, 1)
+                c1.close()                          # 释放槽位
+                time.sleep(0.4)
+                c3 = socket.create_connection(("127.0.0.1", srv.listen_port), timeout=5)
+                c3.sendall(b"ping")
+                self.assertEqual(c3.recv(64), b"ok")  # 槽位归还后恢复服务
+                self.assertEqual(srv.rejected_conns, 1)
+                c3.close()
+        finally:
+            srv.stop(); ups.srv.close()
+
+
+class TestTestDetailsUi(_AppTest):
+    """测试连通的 UI 细节：作废清结果、详情按钮空态提示"""
+
+    def test_invalidate_clears_results(self):
+        self.app._test_results = {"1.1.1.1:80": (True, 12)}
+        self.app._invalidate_test_results()
+        self.assertEqual(self.app._test_results, {})
+
+    def test_details_empty_prompt(self):
+        self.app._test_results = {}
+        with mock.patch.object(pt.messagebox, "showinfo") as info:
+            self.app.show_test_details()
+        info.assert_called_once()
+        self.assertIn("请先点击测试连通", info.call_args.args[1])
 
 
 if __name__ == "__main__":
