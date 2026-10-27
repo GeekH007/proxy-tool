@@ -5,3 +5,9 @@ __pycache__/
 *.pyc
 *.tmp
 .superpowers/
+
+# 测速诊断工具与结果，本地诊断用，不入库
+V2.0/speed_test.py
+V2.0/speed_test.bat
+V2.0/speed_diagnose.bat
+V2.0/speed-results/
