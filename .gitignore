@@ -12,3 +12,14 @@ V2.0/speed_test.bat
 V2.0/speed_diagnose.bat
 V2.0/speed-results/
 V2.0/*.lnk
+
+V2.1/speed_test.py
+V2.1/speed_test.bat
+V2.1/speed_diagnose.bat
+V2.1/speed_diagnose说明.txt
+V2.1/speed_test说明.txt
+V2.1/speed-results/
+V2.1/benchmark.js
+V2.1/benchmark_worker.py
+V2.1/backups/
+V2.1/*.lnk

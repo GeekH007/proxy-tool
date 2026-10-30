@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">
+  <title>LAN Proxy — bidirectional connection</title>
+  <defs><linearGradient id="blue" x1="0" y1="0" x2="0.45" y2="1">
+    <stop stop-color="#2f75f1"/><stop offset="1" stop-color="#1947bd"/>
+  </linearGradient></defs>
+  <rect width="64" height="64" rx="16" fill="url(#blue)"/>
+  <g fill="none" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M17 24H46 M37 15L46 24L37 33" stroke="#ffffff"/>
+    <path d="M47 40H18 M27 31L18 40L27 49" stroke="#95f7e3"/>
+  </g>
+</svg>
